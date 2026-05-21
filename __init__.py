@@ -1,0 +1,8 @@
+"""
+B站-此生已陷-内容加密 ComfyUI 自定义节点
+"""
+from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+
+WEB_DIRECTORY = "./js"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
