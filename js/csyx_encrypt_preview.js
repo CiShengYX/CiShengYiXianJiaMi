@@ -138,7 +138,7 @@ function applyResponsivePreviewLayout(node, widthOverride) {
     if (!widget || !element || !cells.length) return null;
 
     const nodeWidth = Number(widthOverride ?? node.size?.[0] ?? 300);
-    const contentWidth = Math.max(160, nodeWidth - 20);
+    const contentWidth = Math.max(72, nodeWidth - 20);
     const geometry = responsiveGridGeometry(cells.length, contentWidth, node._csyxPreviewAspects || []);
     element.style.gridTemplateColumns = `repeat(${geometry.columns},minmax(0,1fr))`;
     element.style.minHeight = "0";
@@ -153,7 +153,7 @@ function applyResponsivePreviewLayout(node, widthOverride) {
     widget.computeLayoutSize = () => ({
         minHeight: geometry.height,
         maxHeight: geometry.height,
-        minWidth: 200,
+        minWidth: 96,
     });
     // Both APIs are used in current ComfyUI builds. Supplying all three keeps
     // the DOM allocation and the LiteGraph node size in agreement.
@@ -168,20 +168,15 @@ function fitNodeToCustomPreview(node, widthOverride) {
     if (node._csyxPreviewFitting) return;
     node._csyxPreviewFitting = true;
     try {
-        const width = Math.max(260, Number(widthOverride ?? node.size?.[0] ?? 300));
+        const width = Math.max(96, Number(widthOverride ?? node.size?.[0] ?? 300));
         const geometry = applyResponsivePreviewLayout(node, width);
         if (!geometry) return;
-        let computedHeight = 0;
-        try {
-            const computed = node.computeSize?.();
-            if (Array.isArray(computed) && Number.isFinite(computed[1])) {
-                computedHeight = Math.max(0, Number(computed[1]));
-            }
-        } catch (_) {}
-        computedHeight = Math.max(220, requiredNodeHeight(
+        // Do not use node.computeSize() here: current ComfyUI builds can return
+        // the previous manually-resized height, which preserves a large blank
+        // area after the grid wraps into fewer rows.
+        const computedHeight = Math.max(220, requiredNodeHeight(
             node._csyxPreviewBaseHeight,
             geometry.height,
-            computedHeight,
             PREVIEW_NODE_GAP,
         ));
         if (Math.abs(Number(node.size?.[0] || 0) - width) > 0.5
@@ -308,10 +303,10 @@ function showPreview(node, rawItems) {
     widget.computeSize = (width) => {
         const geometry = responsiveGridGeometry(
             items.length,
-            Math.max(160, Number(width || node.size?.[0] || 300) - 20),
+            Math.max(72, Number(width || node.size?.[0] || 300) - 20),
             node._csyxPreviewAspects || [],
         );
-        return [Math.max(260, width || 300), geometry.height];
+        return [Math.max(96, Number(width || node.size?.[0] || 300)), geometry.height];
     };
     node._csyxPreviewWidget = widget;
 
