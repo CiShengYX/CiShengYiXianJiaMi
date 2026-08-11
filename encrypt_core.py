@@ -1,316 +1,426 @@
+"""CSYX 单文件加密核心。
+
+V1 是旧版整体 AES-GCM 格式，仅保留解密兼容。
+V2/V3 使用合法 PNG 封面和 IEND 后的分块 AES-256-GCM 载荷；V3 强化密码派生。
 """
-加密核心模块 - B站-此生已陷-内容加密
-AES-256-GCM 加密，数据追加到 PNG IEND 之后
-"""
+
+from __future__ import annotations
 
 import hashlib
+import io
+import json
 import os
 import struct
+from typing import BinaryIO, Dict, Optional, Tuple
 
-MAGIC = b'\x43\x53\x59\x58\x5f\x45\x4e\x43'  # CSYX_ENC
-VERSION = 1
+
+MAGIC = b"CSYX_ENC"
+LEGACY_VERSION = 1
+COMPAT_VERSION = 2
+VERSION = 3
 
 CONTENT_IMAGE = 0x01
 CONTENT_VIDEO = 0x02
-CONTENT_TEXT  = 0x03
+CONTENT_TEXT = 0x03
 CONTENT_AUDIO = 0x04
-CONTENT_FILE  = 0x05
+CONTENT_FILE = 0x05
+
+DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
+TAG_SIZE = 16
+SALT_SIZE = 16
+NONCE_PREFIX_SIZE = 8
+_V2_FIXED = struct.Struct(">8sBBBBIQI16s8sI")
+_V2_DOMAIN = b"CSYX-V2-KEY\x00"
+_V3_DOMAIN = b"CSYX-V3-PBKDF2\x00"
+_DEFAULT_PASSWORD = b"CSYX_DEFAULT_KEY"
+_MAX_METADATA_SIZE = 1024 * 1024
 
 PBKDF2_ITERATIONS = 100000
-_KEY_CACHE: dict = {}
+V3_PBKDF2_ITERATIONS = 600000
+_LEGACY_KEY_CACHE: Dict[Tuple[str, bytes], bytes] = {}
+_COVER_CLEAN: Optional[bytes] = None
 
 
-def _derive_key(password, salt):
-    cache_key = (password, salt)
-    if cache_key in _KEY_CACHE:
-        return _KEY_CACHE[cache_key]
-    if len(_KEY_CACHE) > 256:
-        _KEY_CACHE.clear()
-    pwd = password.encode('utf-8') if password else b'CSYX_DEFAULT_KEY'
-    key = hashlib.pbkdf2_hmac('sha256', pwd, salt, PBKDF2_ITERATIONS, dklen=32)
-    _KEY_CACHE[cache_key] = key
-    return key
+class CSYXFormatError(ValueError):
+    """文件不是有效的 CSYX 加密文件。"""
 
 
-def _get_cover_png():
-    cover_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cover.png")
-    with open(cover_path, "rb") as f:
-        return f.read()
+class CSYXDependencyError(RuntimeError):
+    """缺少高速加密依赖。"""
 
 
-# Cache cover PNG bytes at module load time
-_COVER_BYTES = None
-_COVER_CLEAN = None
-
-
-def _get_clean_cover_png():
-    global _COVER_BYTES, _COVER_CLEAN
-    if _COVER_CLEAN is None:
-        _COVER_BYTES = _get_cover_png()
-        _COVER_CLEAN = _strip_png_metadata(_COVER_BYTES)
-    return _COVER_CLEAN
-
-
-def _strip_png_metadata(png_data):
-    signature = png_data[:8]
-    if signature != b'\x89PNG\r\n\x1a\n':
-        raise ValueError("Not a valid PNG")
-
-    keep = {b'IHDR', b'PLTE', b'IDAT', b'IEND', b'tRNS', b'cHRM',
-            b'gAMA', b'iCCP', b'sBIT', b'sRGB', b'bKGD', b'hIST',
-            b'pHYs', b'sPLT', b'acTL', b'fcTL', b'fdAT'}
-
-    result = bytearray(signature)
-    pos = 8
-    while pos < len(png_data):
-        if pos + 8 > len(png_data):
-            break
-        length = struct.unpack(">I", png_data[pos:pos+4])[0]
-        chunk_type = png_data[pos+4:pos+8]
-        chunk_end = pos + 12 + length
-        if chunk_end > len(png_data):
-            break
-        if chunk_type in keep:
-            result.extend(png_data[pos:chunk_end])
-        pos = chunk_end
-        if chunk_type == b'IEND':
-            break
-    return bytes(result)
-
-
-def encrypt_data(raw_data, content_type, password="", original_filename=""):
-    aes_encrypt = _get_aes_encrypt_func()
-
-    has_password = 1 if password else 0
-    salt = os.urandom(16)
-    iv = os.urandom(12)
-
-    key = _derive_key(password, salt)
-
-    ciphertext, tag = aes_encrypt(key, iv, raw_data)
-
-    filename_bytes = original_filename.encode('utf-8') if original_filename else b''
-
-    packet = bytearray()
-    packet.extend(MAGIC)
-    packet.append(VERSION)
-    packet.append(content_type)
-    packet.append(has_password)
-    packet.extend(salt)
-    packet.extend(iv)
-    packet.extend(tag)
-    packet.extend(struct.pack(">H", len(filename_bytes)))
-    packet.extend(filename_bytes)
-    packet.extend(struct.pack(">Q", len(ciphertext)))
-    packet.extend(ciphertext)
-
-    clean_cover = _get_clean_cover_png()
-    return clean_cover + bytes(packet)
-
-
-def _get_aes_encrypt_func():
+def _new_aesgcm(key: bytes):
     try:
-        from Crypto.Cipher import AES as _AES
-        def encrypt(key, iv, data):
-            cipher = _AES.new(key, _AES.MODE_GCM, nonce=iv)
-            ct, tag = cipher.encrypt_and_digest(data)
-            return ct, tag
-        return encrypt
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        return AESGCM(key)
     except ImportError:
         pass
-
     try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
-        def encrypt(key, iv, data):
-            aesgcm = _AESGCM(key)
-            ct_tag = aesgcm.encrypt(iv, data, None)
-            return ct_tag[:-16], ct_tag[-16:]
-        return encrypt
-    except ImportError:
-        pass
+        from Crypto.Cipher import AES
+    except ImportError as exc:
+        raise CSYXDependencyError(
+            "缺少高速加密库 cryptography（也未检测到 pycryptodome）。"
+            "请安装节点 requirements.txt 后重启 ComfyUI；为避免长视频极慢，"
+            "本节点不会使用纯 Python 慢速加密。"
+        ) from exc
 
-    # 无加速库警告 — 仅首次触发
-    if not getattr(_get_aes_encrypt_func, '_warned', False):
-        print("[CSYX 警告] 未检测到 pycryptodome 或 cryptography 库，"
-              "将使用纯 Python AES 加密（速度极慢）。"
-              "建议执行: pip install pycryptodome")
-        _get_aes_encrypt_func._warned = True
-    return _pure_python_aes_gcm_encrypt
+    class PyCryptodomeAESGCM:
+        def encrypt(self, nonce: bytes, data: bytes, aad: Optional[bytes]) -> bytes:
+            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=TAG_SIZE)
+            if aad:
+                cipher.update(aad)
+            ciphertext, tag = cipher.encrypt_and_digest(data)
+            return ciphertext + tag
 
+        def decrypt(self, nonce: bytes, data: bytes, aad: Optional[bytes]) -> bytes:
+            if len(data) < TAG_SIZE:
+                raise CSYXFormatError("AES-GCM 数据太短")
+            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=TAG_SIZE)
+            if aad:
+                cipher.update(aad)
+            return cipher.decrypt_and_verify(data[:-TAG_SIZE], data[-TAG_SIZE:])
 
-# ============================================================
-# Pure Python AES-256-GCM (no dependencies)
-# ============================================================
-
-_SBOX = [
-    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
-    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
-    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
-    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
-    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
-    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
-    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
-    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
-    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
-    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
-    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
-    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
-    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
-    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
-    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
-    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
-]
-_RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
+    return PyCryptodomeAESGCM()
 
 
-class _AESCipher:
-    def __init__(self, key):
-        assert len(key) in (16, 24, 32)
-        self._Nk = len(key) // 4
-        self._Nr = self._Nk + 6
-        self._w = self._expand(key)
-
-    def _expand(self, key):
-        Nk, Nr = self._Nk, self._Nr
-        w = []
-        for i in range(Nk):
-            w.append([key[4*i], key[4*i+1], key[4*i+2], key[4*i+3]])
-        for i in range(Nk, 4*(Nr+1)):
-            t = list(w[i-1])
-            if i % Nk == 0:
-                t = [_SBOX[t[1]], _SBOX[t[2]], _SBOX[t[3]], _SBOX[t[0]]]
-                t[0] ^= _RCON[i//Nk - 1]
-            elif Nk > 6 and i % Nk == 4:
-                t = [_SBOX[b] for b in t]
-            w.append([a ^ b for a, b in zip(w[i-Nk], t)])
-        return w
-
-    def encrypt_block(self, block):
-        assert len(block) == 16
-        w, Nr = self._w, self._Nr
-
-        # Load state column-major: s[row][col] = block[row + 4*col]
-        s = [[block[r + 4*c] for c in range(4)] for r in range(4)]
-
-        # Round 0: AddRoundKey
-        for c in range(4):
-            for r in range(4):
-                s[r][c] ^= w[c][r]
-
-        for rnd in range(1, Nr):
-            # SubBytes
-            for r in range(4):
-                for c in range(4):
-                    s[r][c] = _SBOX[s[r][c]]
-            # ShiftRows
-            s[1] = [s[1][1], s[1][2], s[1][3], s[1][0]]
-            s[2] = [s[2][2], s[2][3], s[2][0], s[2][1]]
-            s[3] = [s[3][3], s[3][0], s[3][1], s[3][2]]
-            # MixColumns
-            for c in range(4):
-                a0, a1, a2, a3 = s[0][c], s[1][c], s[2][c], s[3][c]
-                s[0][c], s[1][c], s[2][c], s[3][c] = _mc(a0, a1, a2, a3)
-            # AddRoundKey
-            for c in range(4):
-                wrd = w[rnd*4 + c]
-                for r in range(4):
-                    s[r][c] ^= wrd[r]
-
-        # Final round (no MixColumns)
-        for r in range(4):
-            for c in range(4):
-                s[r][c] = _SBOX[s[r][c]]
-        s[1] = [s[1][1], s[1][2], s[1][3], s[1][0]]
-        s[2] = [s[2][2], s[2][3], s[2][0], s[2][1]]
-        s[3] = [s[3][3], s[3][0], s[3][1], s[3][2]]
-        for c in range(4):
-            wrd = w[Nr*4 + c]
-            for r in range(4):
-                s[r][c] ^= wrd[r]
-
-        out = bytearray(16)
-        for c in range(4):
-            for r in range(4):
-                out[r + 4*c] = s[r][c]
-        return bytes(out)
+def has_fast_crypto() -> bool:
+    try:
+        _new_aesgcm(bytes(32))
+        return True
+    except CSYXDependencyError:
+        return False
 
 
-def _mc(a0, a1, a2, a3):
-    def xt(v):
-        return ((v << 1) ^ 0x1b) & 0xff if v & 0x80 else (v << 1) & 0xff
-    return (
-        xt(a0) ^ xt(a1) ^ a1 ^ a2 ^ a3,
-        a0 ^ xt(a1) ^ xt(a2) ^ a2 ^ a3,
-        a0 ^ a1 ^ xt(a2) ^ xt(a3) ^ a3,
-        xt(a0) ^ a0 ^ a1 ^ a2 ^ xt(a3),
+def _password_bytes(password: str) -> bytes:
+    return password.encode("utf-8") if password else _DEFAULT_PASSWORD
+
+
+def _derive_key_v2(password: str, salt: bytes) -> bytes:
+    if len(salt) != SALT_SIZE:
+        raise ValueError("V2 salt 长度无效")
+    return hashlib.sha256(_V2_DOMAIN + salt + _password_bytes(password)).digest()
+
+
+def _derive_key_v3(password: str, salt: bytes) -> bytes:
+    """V3 password hardening. The domain is part of the authenticated format."""
+    if len(salt) != SALT_SIZE:
+        raise ValueError("V3 salt 长度无效")
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        _password_bytes(password),
+        _V3_DOMAIN + salt,
+        V3_PBKDF2_ITERATIONS,
+        dklen=32,
     )
 
 
-def _inc32(block):
-    b = bytearray(block)
-    c = int.from_bytes(b[12:16], 'big')
-    c = (c + 1) & 0xFFFFFFFF
-    b[12:16] = c.to_bytes(4, 'big')
-    return bytes(b)
+def _derive_key(password: str, salt: bytes) -> bytes:
+    """V1 PBKDF2 密钥派生，供历史文件解密兼容。"""
+    cache_key = (password, salt)
+    cached = _LEGACY_KEY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    if len(_LEGACY_KEY_CACHE) >= 64:
+        _LEGACY_KEY_CACHE.clear()
+    key = hashlib.pbkdf2_hmac(
+        "sha256", _password_bytes(password), salt, PBKDF2_ITERATIONS, dklen=32
+    )
+    _LEGACY_KEY_CACHE[cache_key] = key
+    return key
 
 
-def _gcm_ctr(aes, J0, data):
-    result = bytearray()
-    counter = _inc32(J0)
-    i = 0
-    while i < len(data):
-        block = aes.encrypt_block(counter)
-        chunk = data[i:i+16]
-        for j in range(len(chunk)):
-            result.append(chunk[j] ^ block[j])
-        counter = _inc32(counter)
-        i += 16
+def _get_cover_png() -> bytes:
+    cover_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cover.png")
+    with open(cover_path, "rb") as handle:
+        return handle.read()
+
+
+def _strip_png_metadata(png_data: bytes) -> bytes:
+    if png_data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("封面不是有效的 PNG")
+    keep = {
+        b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"cHRM", b"gAMA",
+        b"iCCP", b"sBIT", b"sRGB", b"bKGD", b"hIST", b"pHYs", b"sPLT",
+        b"acTL", b"fcTL", b"fdAT",
+    }
+    result = bytearray(png_data[:8])
+    pos = 8
+    found_iend = False
+    while pos + 12 <= len(png_data):
+        length = struct.unpack_from(">I", png_data, pos)[0]
+        end = pos + 12 + length
+        if end > len(png_data):
+            raise ValueError("封面 PNG 数据不完整")
+        chunk_type = png_data[pos + 4:pos + 8]
+        if chunk_type in keep:
+            result.extend(png_data[pos:end])
+        pos = end
+        if chunk_type == b"IEND":
+            found_iend = True
+            break
+    if not found_iend:
+        raise ValueError("封面 PNG 缺少 IEND")
     return bytes(result)
 
 
-def _gf128_mult(x, y):
-    R = 0xe1000000000000000000000000000000
-    xi = int.from_bytes(x, 'big')
-    yi = int.from_bytes(y, 'big')
-    z = 0
-    for i in range(128):
-        if (yi >> (127 - i)) & 1:
-            z ^= xi
-        if xi & 1:
-            xi = (xi >> 1) ^ R
-        else:
-            xi >>= 1
-    return z.to_bytes(16, 'big')
+def _get_clean_cover_png() -> bytes:
+    global _COVER_CLEAN
+    if _COVER_CLEAN is None:
+        _COVER_CLEAN = _strip_png_metadata(_get_cover_png())
+    return _COVER_CLEAN
 
 
-def _ghash(H, A, C):
-    def pad16(d):
-        r = len(d) % 16
-        return d + b'\x00' * (16 - r) if r else d
+def png_end_offset(data: bytes) -> int:
+    """返回 PNG IEND 之后的精确偏移，拒绝伪造的 IEND 字节搜索。"""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise CSYXFormatError("不是有效的 PNG 文件")
+    pos = 8
+    while pos + 12 <= len(data):
+        length = struct.unpack_from(">I", data, pos)[0]
+        end = pos + 12 + length
+        if end > len(data):
+            raise CSYXFormatError("PNG 数据不完整")
+        if data[pos + 4:pos + 8] == b"IEND":
+            if length != 0:
+                raise CSYXFormatError("PNG IEND 长度无效")
+            return end
+        pos = end
+    raise CSYXFormatError("PNG 缺少 IEND")
 
-    data = pad16(A) + pad16(C)
-    data += struct.pack(">QQ", len(A) * 8, len(C) * 8)
 
-    y = b'\x00' * 16
-    for i in range(0, len(data), 16):
-        block = data[i:i+16]
-        xored = bytes(a ^ b for a, b in zip(y, block))
-        y = _gf128_mult(H, xored)
-    return y
+def _safe_original_name(name: str) -> str:
+    name = os.path.basename((name or "").replace("\\", "/"))
+    name = "".join(ch for ch in name if ch >= " " and ch not in '\\/:*?"<>|')
+    return name[:240] or "decrypted.bin"
 
 
-def _pure_python_aes_gcm_encrypt(key, iv, plaintext):
-    aes = _AESCipher(key)
-    H = aes.encrypt_block(b'\x00' * 16)
+def _canonical_metadata(
+    original_filename: str, mime_type: str, source_size: int
+) -> bytes:
+    payload = {
+        "filename": _safe_original_name(original_filename),
+        "mime": mime_type or "application/octet-stream",
+        "size": source_size,
+        "version": VERSION,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    if len(encoded) > _MAX_METADATA_SIZE:
+        raise ValueError("元数据过大")
+    return encoded
 
-    if len(iv) == 12:
-        J0 = iv + b'\x00\x00\x00\x01'
-    else:
-        J0 = _ghash(H, b'', iv)
 
-    ciphertext = _gcm_ctr(aes, J0, plaintext)
-    S = _ghash(H, b'', ciphertext)
-    ej0 = aes.encrypt_block(J0)
-    tag = bytes(a ^ b for a, b in zip(S, ej0))
+def _source_size(source: BinaryIO) -> int:
+    if not hasattr(source, "seek") or not hasattr(source, "tell"):
+        raise ValueError("流式加密需要可定位的数据源或明确的 source_size")
+    current = source.tell()
+    source.seek(0, os.SEEK_END)
+    size = source.tell() - current
+    source.seek(current, os.SEEK_SET)
+    return size
 
-    return ciphertext, tag
+
+def encrypt_stream(
+    source: BinaryIO,
+    destination: BinaryIO,
+    content_type: int,
+    password: str = "",
+    original_filename: str = "",
+    mime_type: str = "application/octet-stream",
+    source_size: Optional[int] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> Dict[str, object]:
+    """把数据源加密为 V3 PNG 单文件，额外内存上限约为一个分块。"""
+    if content_type not in {
+        CONTENT_IMAGE, CONTENT_VIDEO, CONTENT_TEXT, CONTENT_AUDIO, CONTENT_FILE
+    }:
+        raise ValueError("未知内容类型")
+    if chunk_size < 64 * 1024 or chunk_size > 64 * 1024 * 1024:
+        raise ValueError("分块大小必须在 64 KiB 到 64 MiB 之间")
+    if source_size is None:
+        source_size = _source_size(source)
+    if source_size < 0:
+        raise ValueError("数据长度无效")
+
+    chunk_count = max(1, (source_size + chunk_size - 1) // chunk_size)
+    if chunk_count > 0xFFFFFFFF:
+        raise ValueError("文件过大，分块数量超出格式限制")
+
+    salt = os.urandom(SALT_SIZE)
+    nonce_prefix = os.urandom(NONCE_PREFIX_SIZE)
+    metadata = _canonical_metadata(original_filename, mime_type, source_size)
+    flags = 1 if password else 0
+    fixed = _V2_FIXED.pack(
+        MAGIC, VERSION, content_type, flags, 0, chunk_size, source_size,
+        chunk_count, salt, nonce_prefix, len(metadata),
+    )
+    header = fixed + metadata
+    key = _derive_key_v3(password, salt)
+    aesgcm = _new_aesgcm(key)
+
+    destination.write(_get_clean_cover_png())
+    destination.write(header)
+    bytes_read = 0
+    for index in range(chunk_count):
+        expected = min(chunk_size, source_size - bytes_read)
+        if source_size == 0:
+            expected = 0
+        parts = []
+        remaining = expected
+        while remaining:
+            part = source.read(remaining)
+            if not part:
+                break
+            if len(part) > remaining:
+                raise OSError("数据源返回了超过请求长度的数据")
+            parts.append(part)
+            remaining -= len(part)
+        plain = b"".join(parts)
+        if len(plain) != expected:
+            raise OSError(
+                f"读取源数据时提前结束：期望 {expected} 字节，实际 {len(plain)} 字节"
+            )
+        nonce = nonce_prefix + struct.pack(">I", index)
+        aad = header + struct.pack(">I", index)
+        encrypted = aesgcm.encrypt(nonce, plain, aad)
+        destination.write(struct.pack(">I", len(plain)))
+        destination.write(encrypted)
+        bytes_read += len(plain)
+
+    if bytes_read != source_size:
+        raise OSError("读取的数据长度与声明长度不一致")
+    extra = source.read(1)
+    if extra:
+        raise OSError("数据源在声明长度之后仍有内容")
+    return {
+        "version": VERSION,
+        "content_type": content_type,
+        "source_size": source_size,
+        "chunk_count": chunk_count,
+        "chunk_size": chunk_size,
+        "metadata": json.loads(metadata.decode("utf-8")),
+    }
+
+
+def encrypt_data(
+    raw_data: bytes,
+    content_type: int,
+    password: str = "",
+    original_filename: str = "",
+    mime_type: str = "application/octet-stream",
+) -> bytes:
+    """小数据兼容接口；大文件应使用 encrypt_stream。"""
+    source = io.BytesIO(raw_data)
+    destination = io.BytesIO()
+    encrypt_stream(
+        source, destination, content_type, password, original_filename,
+        mime_type, len(raw_data),
+    )
+    return destination.getvalue()
+
+
+def _decrypt_v1(packet: bytes, password: str) -> Tuple[bytes, Dict[str, object]]:
+    if len(packet) < 65 or packet[8] != LEGACY_VERSION:
+        raise CSYXFormatError("V1 加密数据太短或版本错误")
+    has_password = packet[10] == 1
+    if has_password != bool(password):
+        raise CSYXFormatError("密码设置不匹配（加密时有密码/无密码）")
+    content_type = packet[9]
+    salt, nonce, tag = packet[11:27], packet[27:39], packet[39:55]
+    filename_len = struct.unpack_from(">H", packet, 55)[0]
+    data_length_offset = 57 + filename_len
+    if data_length_offset + 8 > len(packet):
+        raise CSYXFormatError("V1 文件头不完整")
+    filename = packet[57:data_length_offset].decode("utf-8", errors="replace")
+    encrypted_len = struct.unpack_from(">Q", packet, data_length_offset)[0]
+    cipher_offset = data_length_offset + 8
+    ciphertext = packet[cipher_offset:cipher_offset + encrypted_len]
+    if len(ciphertext) != encrypted_len or cipher_offset + encrypted_len != len(packet):
+        raise CSYXFormatError("V1 密文长度不正确")
+    key = _derive_key(password, salt)
+    plain = _new_aesgcm(key).decrypt(nonce, ciphertext + tag, None)
+    return plain, {
+        "version": LEGACY_VERSION,
+        "content_type": content_type,
+        "has_password": has_password,
+        "filename": filename,
+    }
+
+
+def _decrypt_chunked(packet: bytes, password: str) -> Tuple[bytes, Dict[str, object]]:
+    if len(packet) < _V2_FIXED.size:
+        raise CSYXFormatError("分块加密文件头不完整")
+    (
+        magic, version, content_type, flags, reserved, chunk_size, plain_size,
+        chunk_count, salt, nonce_prefix, metadata_len,
+    ) = _V2_FIXED.unpack_from(packet)
+    if magic != MAGIC or version not in (COMPAT_VERSION, VERSION) or reserved != 0:
+        raise CSYXFormatError("分块加密文件头无效")
+    if flags & ~1:
+        raise CSYXFormatError("分块加密标志位无效")
+    if bool(flags & 1) != bool(password):
+        raise CSYXFormatError("密码设置不匹配（加密时有密码/无密码）")
+    if not 64 * 1024 <= chunk_size <= 64 * 1024 * 1024:
+        raise CSYXFormatError("分块大小无效")
+    expected_count = max(1, (plain_size + chunk_size - 1) // chunk_size)
+    if chunk_count != expected_count or metadata_len > _MAX_METADATA_SIZE:
+        raise CSYXFormatError("分块加密长度字段无效")
+    meta_start = _V2_FIXED.size
+    meta_end = meta_start + metadata_len
+    if meta_end > len(packet):
+        raise CSYXFormatError("分块加密元数据不完整")
+    header = packet[:meta_end]
+    try:
+        metadata = json.loads(packet[meta_start:meta_end].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CSYXFormatError("分块加密元数据无效") from exc
+    if not isinstance(metadata, dict) or metadata.get("size") != plain_size:
+        raise CSYXFormatError("分块加密元数据长度与文件头不一致")
+
+    derive_key = _derive_key_v2 if version == COMPAT_VERSION else _derive_key_v3
+    aesgcm = _new_aesgcm(derive_key(password, salt))
+    output = bytearray()
+    pos = meta_end
+    for index in range(chunk_count):
+        if pos + 4 > len(packet):
+            raise CSYXFormatError("加密块不完整")
+        plain_len = struct.unpack_from(">I", packet, pos)[0]
+        pos += 4
+        expected_len = min(chunk_size, plain_size - len(output))
+        if plain_size == 0:
+            expected_len = 0
+        if plain_len != expected_len or pos + plain_len + TAG_SIZE > len(packet):
+            raise CSYXFormatError("加密块长度无效")
+        encrypted = packet[pos:pos + plain_len + TAG_SIZE]
+        pos += plain_len + TAG_SIZE
+        nonce = nonce_prefix + struct.pack(">I", index)
+        aad = header + struct.pack(">I", index)
+        output.extend(aesgcm.decrypt(nonce, encrypted, aad))
+    if pos != len(packet) or len(output) != plain_size:
+        raise CSYXFormatError("分块加密文件尾或总长度无效")
+    metadata.update({
+        "version": version,
+        "content_type": content_type,
+        "has_password": bool(flags & 1),
+    })
+    return bytes(output), metadata
+
+
+def decrypt_data_with_metadata(data: bytes, password: str = "") -> Tuple[bytes, Dict[str, object]]:
+    packet_offset = png_end_offset(data)
+    if packet_offset >= len(data):
+        raise CSYXFormatError("文件没有加密数据")
+    packet = data[packet_offset:]
+    if len(packet) < 9 or packet[:8] != MAGIC:
+        raise CSYXFormatError("不是 CSYX 加密文件")
+    if packet[8] == LEGACY_VERSION:
+        return _decrypt_v1(packet, password)
+    if packet[8] in (COMPAT_VERSION, VERSION):
+        return _decrypt_chunked(packet, password)
+    raise CSYXFormatError(f"不支持的 CSYX 版本：{packet[8]}")
+
+
+def decrypt_data(data: bytes, password: str = "") -> bytes:
+    plain, _ = decrypt_data_with_metadata(data, password)
+    return plain

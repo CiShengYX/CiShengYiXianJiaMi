@@ -1,418 +1,448 @@
-"""
-ComfyUI 节点 - B站-此生已陷-数据加密
-优化版本：硬件编码、帧批处理、预加载
-"""
-import os, sys, struct, threading, tempfile, subprocess
+"""ComfyUI 节点 - B站-此生已陷-内容加密。"""
+
+from __future__ import annotations
+
+import io
+import mimetypes
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import wave
+
 import numpy as np
-import torch
 
 from .encrypt_core import (
-    encrypt_data, CONTENT_IMAGE, CONTENT_VIDEO, CONTENT_TEXT,
-    CONTENT_AUDIO, CONTENT_FILE, MAGIC,
-    _AESCipher, _ghash, _gcm_ctr, _derive_key
+    CONTENT_AUDIO,
+    CONTENT_FILE,
+    CONTENT_IMAGE,
+    CONTENT_TEXT,
+    CONTENT_VIDEO,
+    encrypt_stream,
+    has_fast_crypto,
 )
 
-# ============================================================
-# 预加载（在 FFmpeg 编码期间后台完成）
-# ============================================================
-def _prewarm_encryption():
-    try:
-        from .encrypt_core import _get_clean_cover_png, _get_aes_encrypt_func
-        _get_clean_cover_png()
-        _get_aes_encrypt_func()
-    except Exception:
-        pass
-
-
-# ============================================================
-# 通用工具
-# ============================================================
-def _read_file_bytes(fp):
-    with open(fp, "rb") as f:
-        return f.read()
-
-
-def _get_aes_decrypt_func():
-    for mod_name, cls_name in [
-        ("Crypto.Cipher", "AES"),
-        ("cryptography.hazmat.primitives.ciphers.aead", "AESGCM"),
-    ]:
-        try:
-            mod = __import__(mod_name, fromlist=[cls_name])
-            cls = getattr(mod, cls_name)
-            if mod_name == "Crypto.Cipher":
-                def _pycrypto_decrypt(key, iv, ct_tag):
-                    cipher = cls.new(key, cls.MODE_GCM, nonce=iv)
-                    tag = ct_tag[-16:]
-                    ct = ct_tag[:-16]
-                    return cipher.decrypt_and_verify(ct, tag)
-                return _pycrypto_decrypt
-            else:
-                def _cryptography_decrypt(key, iv, ct_tag):
-                    aesgcm = cls(key)
-                    return aesgcm.decrypt(iv, ct_tag, None)
-                return _cryptography_decrypt
-        except ImportError:
-            continue
-    return _pure_python_aes_gcm_decrypt
-
-
-def _pure_python_aes_gcm_decrypt(key, iv, ciphertext_with_tag):
-    """纯 Python AES-256-GCM 解密（仅在没有 pycryptodome/cryptography 时使用）"""
-    aes = _AESCipher(key)
-    H = aes.encrypt_block(b'\x00' * 16)
-    J0 = iv + b'\x00\x00\x00\x01'
-    ciphertext = ciphertext_with_tag[:-16]
-    tag = ciphertext_with_tag[-16:]
-    plaintext = _gcm_ctr(aes, J0, ciphertext)
-    S = _ghash(H, b'', ciphertext)
-    ej0 = aes.encrypt_block(J0)
-    expected_tag = bytes(a ^ b for a, b in zip(S, ej0))
-    if expected_tag != tag:
-        raise ValueError("解密失败：标签验证未通过（可能密钥错误或文件损坏）")
-    return plaintext
-
-
-def decrypt_data(data, password=""):
-    """解密 CSYX 加密数据（与网页版兼容，不可修改格式）
-
-    二进制包格式（encrypt_data 输出）：
-      MAGIC(8) | VERSION(1) | content_type(1) | has_password(1) |
-      salt(16) | iv(12) | tag(16) | fn_len(2) | filename(fn_len) |
-      ct_len(8) | ciphertext(ct_len)
-    """
-    if len(data) < 8 or data[:8] != b'\x89PNG\r\n\x1a\n':
-        raise ValueError("不是有效的 PNG 文件")
-
-    pos = data.find(b"IEND")
-    if pos < 0:
-        raise ValueError("未找到 IEND 标记")
-    # IEND chunk: 4 bytes 'IEND' + 4 bytes CRC
-    end = pos + 8
-
-    if end >= len(data):
-        raise ValueError("文件格式不完整")
-
-    pkt = data[end:]
-    if len(pkt) < 57:
-        raise ValueError("加密数据块太小")
-
-    if pkt[:8] != MAGIC:
-        raise ValueError("不是 CSYX 加密文件")
-
-    content_type = pkt[9]
-    has_password = 1 if password else 0
-    has_pass_flag = pkt[10]
-
-    if has_pass_flag != has_password:
-        raise ValueError("密码设置不匹配（该文件可能需要/不需要密码）")
-
-    salt = pkt[11:27]
-    iv = pkt[27:39]
-    tag = pkt[39:55]
-
-    fn_len = struct.unpack(">H", pkt[55:57])[0]
-    orig_fn = pkt[57:57 + fn_len].decode("utf-8", errors="replace")
-
-    ct_len_offset = 57 + fn_len
-    ct_len = struct.unpack(">Q", pkt[ct_len_offset:ct_len_offset + 8])[0]
-    ct_offset = ct_len_offset + 8
-    ct = pkt[ct_offset:ct_offset + ct_len]
-
-    aes_decrypt = _get_aes_decrypt_func()
-    pwd = password if password else "CSYX_DEFAULT_KEY"
-    key = _derive_key(pwd, salt)
-    plain = aes_decrypt(key, iv, ct + tag)
-    return plain
-
-
-# ============================================================
-# OUTPUT / TEMP 目录
-# ============================================================
-OUTPUT_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "output"
-)
 
 try:
     import folder_paths
-    TEMP_DIR = folder_paths.get_temp_directory()
-except Exception:
-    TEMP_DIR = os.path.join(os.path.dirname(OUTPUT_DIR), "temp")
+except ImportError:
+    folder_paths = None
 
 
-# ============================================================
-# 保存
-# ============================================================
-def _save(data, prefix, name="", ext=".png", target_dir=None):
-    d = target_dir or OUTPUT_DIR
-    os.makedirs(d, exist_ok=True)
-    base = name.strip().lower().replace(" ", "_") or prefix
-    if not base.endswith(ext):
-        base += ext
-
-    fn = os.path.join(d, base)
-    if os.path.exists(fn):
-        existing = {n.lower() for n in os.listdir(d)}
-        i = 1
-        while base.lower() in existing:
-            base = f"{prefix}_{i:05d}{ext}"
-            i += 1
-        fn = os.path.join(d, base)
-
-    with open(fn, "wb") as f:
-        f.write(data)
-    return os.path.basename(fn)
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+_MODULE_PARENT = os.path.dirname(_MODULE_DIR)
+_FALLBACK_ROOT = (
+    os.path.dirname(_MODULE_PARENT)
+    if os.path.basename(_MODULE_PARENT).lower() == "custom_nodes"
+    else _MODULE_PARENT
+)
+_NAME_LOCK = threading.Lock()
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
-# ============================================================
-# Tensor → PNG（用于图片加密节点）
-# ============================================================
-def _tensor_to_png(t):
-    import zlib
-    img = (t.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    a, h, w, c = img.shape
-    ct = {4: 6, 3: 2, 1: 0}.get(c, 2)
-
-    # 构建扫描线（filter byte 0 + 像素数据），单条 zlib 流压缩
-    raw = bytearray()
-    img_hwc = img[0]  # (H, W, C)
-    for y in range(h):
-        raw.append(0)  # filter: None
-        raw.extend(img_hwc[y].tobytes())  # row pixels: R,G,B or R,G,B,A or Gray
-    compressed = zlib.compress(bytes(raw))
-
-    def _chunk(chunk_type, data):
-        """构建带 CRC32 的 PNG 块"""
-        chunk = chunk_type + data
-        return struct.pack(">I", len(data)) + chunk + struct.pack(">I", zlib.crc32(chunk) & 0xFFFFFFFF)
-
-    png = bytearray(b'\x89PNG\r\n\x1a\n')
-    png.extend(_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ct, 0, 0, 0)))
-    png.extend(_chunk(b"IDAT", compressed))
-    png.extend(_chunk(b"IEND", b""))
-    return bytes(png)
+def _output_dir() -> str:
+    path = (
+        folder_paths.get_output_directory()
+        if folder_paths is not None
+        else os.path.join(_FALLBACK_ROOT, "output")
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
-# ============================================================
-# 音频编码
-# ============================================================
-def _save_wav(audio_data, fp):
-    waveform_key = "waveform" if hasattr(audio_data, "get") else None
-    if waveform_key:
-        wf = audio_data[waveform_key]
-        sr = audio_data.get("sample_rate", 16000)
-    else:
-        wf = audio_data
-        sr = 16000
-
-    a = wf.cpu().numpy()
-    if a.ndim == 3 and a.shape[0] == 1:
-        a = a[0]
-    ch = a.shape[0] if a.ndim == 2 else 1
-    ns = a.shape[-1]
-
-    a16 = (a.clip(-1, 1) * 32767).astype(np.int16)
-
-    # 多声道交织：PyTorch tensor (channels, samples) → WAV interleaved (s0_c0, s0_c1, s1_c0, ...)
-    if ch > 1:
-        il = np.zeros(ns * ch, dtype=np.int16)
-        for c in range(ch):
-            il[c::ch] = a16[c]
-    else:
-        il = a16
-
-    with open(fp, "wb") as f:
-        dsz = ns * ch * 2
-        f.write(b"RIFF")
-        f.write(struct.pack("<I", 36 + dsz))
-        f.write(b"WAVEfmt ")
-        f.write(struct.pack("<I", 16))
-        f.write(struct.pack("<H", 1))
-        f.write(struct.pack("<H", ch))
-        f.write(struct.pack("<I", sr))
-        f.write(struct.pack("<I", sr * ch * 2))
-        f.write(struct.pack("<H", ch * 2))
-        f.write(struct.pack("<H", 16))
-        f.write(b"data")
-        f.write(struct.pack("<I", dsz))
-        f.write(il.astype(np.int16).tobytes())
+def _temp_dir() -> str:
+    path = (
+        folder_paths.get_temp_directory()
+        if folder_paths is not None
+        else os.path.join(_FALLBACK_ROOT, "temp")
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
-def _wav_bytes(audio_data):
-    fd, tp = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    try:
-        _save_wav(audio_data, tp)
-        with open(tp, "rb") as f:
-            return f.read()
-    finally:
-        os.unlink(tp)
+def _input_dir() -> str:
+    path = (
+        folder_paths.get_input_directory()
+        if folder_paths is not None
+        else os.path.join(_FALLBACK_ROOT, "input")
+    )
+    os.makedirs(path, exist_ok=True)
+    return os.path.realpath(path)
 
 
-def _save_temp(data, name):
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    with open(os.path.join(TEMP_DIR, name), "wb") as f:
-        f.write(data)
-
-
-# ============================================================
-# 视频编码（优化版）
-# ============================================================
-def _video_bytes(image_tensor, fps, audio_data=None):
-    """帧张量+音频 → MP4 字节（硬件编码优先 + 批量写入）"""
-    n, h, w = image_tensor.shape[0], image_tensor.shape[1], image_tensor.shape[2]
-
-    # 预处理帧数据（只做一次）
-    frames_np = (image_tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-
-    # 准备临时目录
-    td = tempfile.mkdtemp()
-    has_audio = audio_data is not None
-    if has_audio:
-        af = os.path.join(td, "a.wav")
-        _save_wav(audio_data, af)
-
-    def _cleanup():
-        import shutil
-        shutil.rmtree(td, ignore_errors=True)
-
-    # 统一用临时文件输出（兼容所有系统和编码器）
-    out_file = os.path.join(td, "o.mp4")
-
-    # 统一 libx264 软件编码（云端 NVENC 库依赖问题不稳定，直接软编最快最可靠）
-    encoder_configs = [
-        ("libx264", ["-preset", "ultrafast", "-crf", "28",
-         "-tune", "zerolatency", "-bf", "0", "-refs", "1",
-         "-sc_threshold", "0", "-g", "99999"], "libx264"),
-    ]
-
-    last_error = None
-    for enc_name, enc_args, enc_label in encoder_configs:
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", f"{w}x{h}", "-r", str(fps), "-i", "pipe:0",
-        ]
-        if has_audio:
-            cmd.extend(["-i", af])
-        cmd.extend(["-c:v", enc_name, *enc_args])
-        if has_audio:
-            cmd.extend(["-c:a", "aac", "-b:a", "128k", "-shortest"])
-        cmd.extend(["-pix_fmt", "yuv420p", "-f", "mp4", out_file])
-
-        # 启动 FFmpeg
-        popen_kw = {
-            "stdin": subprocess.PIPE,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.PIPE,
-        }
-        if sys.platform == "win32":
-            popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            popen_kw["startupinfo"] = si
-
-        try:
-            proc = subprocess.Popen(cmd, **popen_kw)
-        except FileNotFoundError:
-            _cleanup()
-            raise RuntimeError("未找到 ffmpeg，请确认已安装并加入 PATH")
-
-        # stderr 读取线程
-        stderr_chunks = []
-        def _drain_stderr():
+def _input_files() -> list[str]:
+    root = _input_dir()
+    files = []
+    for current, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = [name for name in dirs if not os.path.islink(os.path.join(current, name))]
+        for name in names:
+            candidate = os.path.realpath(os.path.join(current, name))
             try:
-                for chunk in iter(lambda: proc.stderr.read(4096), b""):
-                    stderr_chunks.append(chunk)
-            except Exception:
+                if os.path.commonpath((root, candidate)) != root or not os.path.isfile(candidate):
+                    continue
+            except ValueError:
+                continue
+            files.append(os.path.relpath(candidate, root).replace(os.sep, "/"))
+    return sorted(files, key=str.casefold) or ["未找到输入文件"]
+
+
+def _resolve_input_file(relative_name: str) -> str:
+    value = (relative_name or "").strip().replace("\\", "/")
+    if not value or value == "未找到输入文件" or os.path.isabs(value):
+        raise ValueError("请选择 ComfyUI input 目录中的文件")
+    root = _input_dir()
+    candidate = os.path.realpath(os.path.join(root, value.replace("/", os.sep)))
+    try:
+        inside = os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        inside = False
+    if not inside or not os.path.isfile(candidate):
+        raise ValueError("文件不存在或超出 ComfyUI input 目录")
+    return candidate
+
+
+def _ensure_fast_crypto() -> None:
+    if not has_fast_crypto():
+        raise RuntimeError(
+            "缺少高速加密库 cryptography。请在此节点目录执行 "
+            "pip install -r requirements.txt，然后重启 ComfyUI。"
+        )
+
+
+def _safe_base(name: str, fallback: str) -> str:
+    value = (name or "").strip()
+    if value.lower().endswith(".png"):
+        value = value[:-4]
+    value = os.path.basename(value.replace("\\", "/"))
+    value = "".join(ch for ch in value if ch >= " " and ch not in '\\/:*?"<>|')
+    value = value.rstrip(". ")[:180]
+    if not value:
+        value = fallback
+    if value.upper() in _WINDOWS_RESERVED:
+        value = f"_{value}"
+    return value
+
+
+def _reserve_output(prefix: str, requested_name: str = ""):
+    output_dir = _output_dir()
+    base = _safe_base(requested_name, prefix)
+    has_requested_name = bool((requested_name or "").strip())
+    with _NAME_LOCK:
+        index = 0
+        while True:
+            if has_requested_name:
+                filename = f"{base}.png" if index == 0 else f"{base}_{index}.png"
+            else:
+                filename = f"{base}_{index + 1:05d}.png"
+            final_path = os.path.join(output_dir, filename)
+            try:
+                fd = os.open(final_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                break
+            except FileExistsError:
+                index += 1
+    return final_path, {
+        "filename": filename,
+        "subfolder": "",
+        "type": "output",
+    }
+
+
+def _save_encrypted_stream(
+    source,
+    source_size: int,
+    content_type: int,
+    password: str,
+    original_filename: str,
+    mime_type: str,
+    prefix: str,
+    requested_name: str,
+):
+    _ensure_fast_crypto()
+    final_path, descriptor = _reserve_output(prefix, requested_name)
+    temp_fd, temp_path = tempfile.mkstemp(
+        prefix="._csyx_", suffix=".tmp", dir=os.path.dirname(final_path)
+    )
+    started = time.perf_counter()
+    try:
+        with os.fdopen(temp_fd, "wb") as destination:
+            encrypt_stream(
+                source=source,
+                destination=destination,
+                content_type=content_type,
+                password=password,
+                original_filename=original_filename,
+                mime_type=mime_type,
+                source_size=source_size,
+            )
+            destination.flush()
+        os.replace(temp_path, final_path)
+    except Exception:
+        try:
+            os.close(temp_fd)
+        except OSError:
+            pass
+        for path in (temp_path, final_path):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
                 pass
-        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-        stderr_thread.start()
+            except OSError:
+                pass
+        raise
+    elapsed = time.perf_counter() - started
+    size_mib = source_size / (1024 * 1024)
+    print(f"[CSYX] 已加密 {size_mib:.2f} MiB，用时 {elapsed:.3f} 秒")
+    return descriptor
 
-        # 批量写入帧
-        write_error = None
-        frame_bytes = w * h * 3
-        batch_frames = max(1, min(30, (256 * 1024 * 1024) // max(frame_bytes, 1)))
-        try:
-            for batch_start in range(0, n, batch_frames):
-                batch_end = min(batch_start + batch_frames, n)
-                batch = bytearray()
-                for i in range(batch_start, batch_end):
-                    batch.extend(np.ascontiguousarray(frames_np[i]).tobytes())
-                proc.stdin.write(bytes(batch))
-        except (BrokenPipeError, OSError) as e:
-            write_error = e
 
+def _ui_result(descriptors):
+    # csyx_image 保留字符串格式，避免新版资产扫描重复登记同一描述符。
+    return {
+        "ui": {
+            "images": descriptors,
+            "csyx_image": [item["filename"] for item in descriptors],
+            "csyx_mode": ["encrypt"],
+        }
+    }
+
+
+def _remove_created_outputs(descriptors) -> None:
+    output_root = os.path.realpath(_output_dir())
+    for descriptor in descriptors:
+        candidate = os.path.realpath(os.path.join(
+            output_root, descriptor.get("subfolder", ""), descriptor["filename"]
+        ))
         try:
-            proc.stdin.close()
+            if os.path.commonpath([output_root, candidate]) == output_root:
+                os.remove(candidate)
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+
+
+def _tensor_frame_to_png(frame) -> io.BytesIO:
+    from PIL import Image
+
+    array = frame.detach().cpu().numpy() if hasattr(frame, "detach") else frame.cpu().numpy()
+    array = np.nan_to_num(array, nan=0.0, posinf=1.0, neginf=0.0)
+    array = (array * 255.0).clip(0, 255).astype(np.uint8)
+    if array.ndim == 2:
+        image = Image.fromarray(array, mode="L")
+    elif array.ndim == 3 and array.shape[2] == 1:
+        image = Image.fromarray(array[:, :, 0], mode="L")
+    elif array.ndim == 3 and array.shape[2] == 4:
+        image = Image.fromarray(array, mode="RGBA")
+    elif array.ndim == 3 and array.shape[2] >= 3:
+        image = Image.fromarray(array[:, :, :3], mode="RGB")
+    else:
+        raise ValueError(f"不支持的图片形状：{array.shape}")
+    stream = io.BytesIO()
+    image.save(stream, format="PNG", compress_level=4, optimize=False)
+    stream.seek(0)
+    return stream
+
+
+def _write_wav(audio_data, filepath: str) -> None:
+    waveform = audio_data["waveform"]
+    sample_rate = int(audio_data["sample_rate"])
+    if len(waveform.shape) == 3:
+        waveform = waveform[0]
+    if len(waveform.shape) != 2:
+        raise ValueError(f"不支持的音频形状：{tuple(waveform.shape)}")
+    channels, samples = int(waveform.shape[0]), int(waveform.shape[1])
+    if channels < 1 or channels > 32:
+        raise ValueError(f"不支持的音频声道数：{channels}")
+    block_samples = 262144
+    with wave.open(filepath, "wb") as output:
+        output.setnchannels(channels)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        for start in range(0, samples, block_samples):
+            block = waveform[:, start:start + block_samples]
+            if hasattr(block, "detach"):
+                block = block.detach()
+            array = block.cpu().numpy()
+            interleaved = (
+                np.nan_to_num(array, nan=0.0, posinf=1.0, neginf=-1.0)
+                .clip(-1.0, 1.0)
+                .T.reshape(-1)
+            )
+            pcm = (interleaved * 32767.0).clip(-32768, 32767).astype("<i2")
+            output.writeframesraw(pcm.tobytes())
+
+
+def _ffmpeg_executable() -> str:
+    executable = shutil.which("ffmpeg")
+    if not executable:
+        raise RuntimeError("未找到 FFmpeg。请在云端镜像或本地环境安装 FFmpeg 并加入 PATH。")
+    return executable
+
+
+def _encode_video(image_tensor, fps: float, audio_data, output_path: str) -> float:
+    frame_count = int(image_tensor.shape[0])
+    height = int(image_tensor.shape[1])
+    width = int(image_tensor.shape[2])
+    channels = int(image_tensor.shape[3]) if len(image_tensor.shape) > 3 else 1
+    if frame_count < 1 or width < 1 or height < 1:
+        raise ValueError("视频输入没有有效帧")
+
+    audio_path = None
+    if audio_data is not None:
+        audio_fd, audio_path = tempfile.mkstemp(suffix=".wav", dir=_temp_dir())
+        os.close(audio_fd)
+        try:
+            _write_wav(audio_data, audio_path)
+        except Exception:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+            raise
+
+    command = [
+        _ffmpeg_executable(), "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
+        "-r", str(float(fps)), "-i", "pipe:0",
+    ]
+    if audio_path:
+        command += ["-i", audio_path]
+    command += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
+    ]
+    if audio_path:
+        command += ["-c:a", "aac", "-b:a", "128k", "-shortest"]
+    command += ["-movflags", "+faststart", output_path]
+
+    popen_kwargs = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    started = time.perf_counter()
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+    except Exception:
+        if audio_path:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+        raise
+    stderr_tail = bytearray()
+
+    def drain_stderr():
+        try:
+            while True:
+                chunk = process.stderr.read(4096)
+                if not chunk:
+                    break
+                stderr_tail.extend(chunk)
+                if len(stderr_tail) > 65536:
+                    del stderr_tail[:-65536]
         except Exception:
             pass
 
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+    write_error = None
+    try:
+        for index in range(frame_count):
+            frame = image_tensor[index]
+            if hasattr(frame, "detach"):
+                frame = frame.detach()
+            array = frame.cpu().numpy()
+            array = np.nan_to_num(array, nan=0.0, posinf=1.0, neginf=0.0)
+            array = (array * 255.0).clip(0, 255).astype(np.uint8)
+            if array.ndim == 2:
+                array = np.repeat(array[:, :, None], 3, axis=2)
+            elif channels == 1 or array.shape[2] == 1:
+                array = np.repeat(array[:, :, :1], 3, axis=2)
+            else:
+                array = array[:, :, :3]
+            try:
+                process.stdin.write(np.ascontiguousarray(array).tobytes())
+            except (BrokenPipeError, OSError) as exc:
+                write_error = exc
+                break
+    finally:
         try:
-            proc.wait(timeout=300)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
-            stderr_thread.join(timeout=5)
-            last_error = RuntimeError(f"ffmpeg 编码超时 ({enc_label})")
-            continue
+            process.stdin.close()
         except Exception:
-            proc.kill()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
-            stderr_thread.join(timeout=5)
-            raise
+            pass
 
+    try:
+        process.wait(timeout=300)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        raise RuntimeError("FFmpeg 编码超过 300 秒，已停止") from exc
+    finally:
         stderr_thread.join(timeout=5)
+        try:
+            process.stderr.close()
+        except Exception:
+            pass
+        if audio_path:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
-        if proc.returncode != 0:
-            stderr_output = b"".join(stderr_chunks)
-            err = stderr_output.decode("utf-8", errors="replace")[:500] if stderr_output else "unknown"
-            if write_error:
-                err += f" (写入中断: {write_error})"
-            last_error = RuntimeError(f"ffmpeg 编码失败 ({enc_label}): {err}")
-            continue
-
-        # 成功 — 读取临时文件
-        with open(out_file, "rb") as f:
-            mp4_bytes = f.read()
-        _cleanup()
-        return mp4_bytes
-
-    _cleanup()
-    raise last_error or RuntimeError("ffmpeg 编码失败：未知错误")
+    if process.returncode != 0:
+        detail = stderr_tail.decode("utf-8", errors="replace").strip()[-2000:]
+        if write_error:
+            detail = f"{detail}\n写入视频帧失败：{write_error}".strip()
+        raise RuntimeError(f"FFmpeg 编码失败：{detail or '未知错误'}")
+    elapsed = time.perf_counter() - started
+    print(f"[CSYX] FFmpeg 编码 {frame_count} 帧，用时 {elapsed:.3f} 秒")
+    return elapsed
 
 
-# ============================================================
-# ComfyUI 节点类
-# ============================================================
 class ImageEncryptNode:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "图片": ("IMAGE",),
-                "密码": ("STRING", {"default": ""}),
-                "文件名": ("STRING", {"default": ""}),
-            }
+            "required": {"图片": ("IMAGE",)},
+            "optional": {
+                "密码": ("STRING", {"default": "", "multiline": False}),
+                "文件名": ("STRING", {"default": "", "multiline": False}),
+            },
         }
 
-    RETURN_TYPES = ("STRING",)
+    RETURN_TYPES = ()
     FUNCTION = "encrypt"
-    CATEGORY = "B站-此生已陷-数据加密"
+    CATEGORY = "B站-此生已陷-内容加密"
     OUTPUT_NODE = True
 
-    def encrypt(self, 图片, 密码="", 文件名="", unique_id=None):
-        png_data = _tensor_to_png(图片)
-        enc = encrypt_data(png_data, CONTENT_IMAGE, 密码, 文件名 or "image.png")
-        fn = _save(enc, "encrypted_image", 文件名, ".png")
-        return {"ui": {"csyx_image": [fn], "csyx_mode": ["encrypt"]}, "result": (fn,)}
+    def encrypt(self, 图片, 密码="", 文件名=""):
+        descriptors = []
+        count = int(图片.shape[0])
+        try:
+            for index in range(count):
+                stream = _tensor_frame_to_png(图片[index])
+                requested = f"{文件名}_{index + 1}" if 文件名 and count > 1 else 文件名
+                try:
+                    descriptors.append(_save_encrypted_stream(
+                        stream, stream.getbuffer().nbytes, CONTENT_IMAGE, 密码,
+                        f"image_{index + 1}.png" if count > 1 else "image.png",
+                        "image/png", "encrypted_image", requested,
+                    ))
+                finally:
+                    stream.close()
+        except Exception:
+            _remove_created_outputs(descriptors)
+            raise
+        return _ui_result(descriptors)
 
 
 class VideoEncryptNode:
@@ -421,112 +451,134 @@ class VideoEncryptNode:
         return {
             "required": {
                 "图像": ("IMAGE",),
-                "帧率": ("FLOAT", {"default": 16.0, "min": 1, "max": 120}),
+                "帧率": ("FLOAT", {"default": 16.0, "min": 1.0, "max": 120.0, "step": 0.01}),
+            },
+            "optional": {
                 "音频": ("AUDIO",),
-                "密码": ("STRING", {"default": ""}),
-                "文件名": ("STRING", {"default": ""}),
-            }
+                "密码": ("STRING", {"default": "", "multiline": False}),
+                "文件名": ("STRING", {"default": "", "multiline": False}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("STRING",)
+    RETURN_TYPES = ()
     FUNCTION = "encrypt"
-    CATEGORY = "B站-此生已陷-数据加密"
+    CATEGORY = "B站-此生已陷-内容加密"
     OUTPUT_NODE = True
 
     def encrypt(self, 图像, 帧率=16.0, 音频=None, 密码="", 文件名="", unique_id=None):
-        prewarm_done = threading.Event()
-
-        def prewarm():
+        _ensure_fast_crypto()
+        fd, video_path = tempfile.mkstemp(suffix=".mp4", dir=_temp_dir())
+        os.close(fd)
+        try:
+            _encode_video(图像, 帧率, 音频, video_path)
+            with open(video_path, "rb") as source:
+                descriptor = _save_encrypted_stream(
+                    source, os.path.getsize(video_path), CONTENT_VIDEO, 密码,
+                    "video.mp4", "video/mp4", "encrypted_video", 文件名,
+                )
+        finally:
             try:
-                _prewarm_encryption()
-            finally:
-                prewarm_done.set()
-
-        prewarm_thread = threading.Thread(target=prewarm, daemon=True)
-        prewarm_thread.start()
-
-        vb = _video_bytes(图像, 帧率, 音频)
-        prewarm_done.wait(timeout=0.5)
-        enc = encrypt_data(vb, CONTENT_VIDEO, 密码, 文件名 or "video.mp4")
-        fn = _save(enc, "encrypted_video", 文件名, ".png")
-        return {"ui": {"csyx_image": [fn], "csyx_mode": ["encrypt"]}, "result": (fn,)}
+                os.remove(video_path)
+            except OSError:
+                pass
+        return _ui_result([descriptor])
 
 
 class TextEncryptNode:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "文本": ("STRING", {"multiline": True}),
-                "密码": ("STRING", {"default": ""}),
-                "文件名": ("STRING", {"default": ""}),
-            }
+            "required": {"文字内容": ("STRING", {"default": "", "multiline": True})},
+            "optional": {
+                "密码": ("STRING", {"default": "", "multiline": False}),
+                "文件名": ("STRING", {"default": "", "multiline": False}),
+            },
         }
 
-    RETURN_TYPES = ("STRING",)
+    RETURN_TYPES = ()
     FUNCTION = "encrypt"
-    CATEGORY = "B站-此生已陷-数据加密"
+    CATEGORY = "B站-此生已陷-内容加密"
     OUTPUT_NODE = True
 
-    def encrypt(self, 文本, 密码="", 文件名="", unique_id=None):
-        data = 文本.encode("utf-8")
-        enc = encrypt_data(data, CONTENT_TEXT, 密码, 文件名 or "text.txt")
-        fn = _save(enc, "encrypted_text", 文件名, ".png")
-        return {"ui": {"csyx_image": [fn], "csyx_mode": ["encrypt"]}, "result": (fn,)}
+    def encrypt(self, 文字内容, 密码="", 文件名=""):
+        data = 文字内容.encode("utf-8")
+        source = io.BytesIO(data)
+        descriptor = _save_encrypted_stream(
+            source, len(data), CONTENT_TEXT, 密码, "text.txt", "text/plain;charset=utf-8",
+            "encrypted_text", 文件名,
+        )
+        return _ui_result([descriptor])
 
 
 class AudioEncryptNode:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "音频": ("AUDIO",),
-                "密码": ("STRING", {"default": ""}),
-                "文件名": ("STRING", {"default": ""}),
-            }
+            "required": {"音频": ("AUDIO",)},
+            "optional": {
+                "密码": ("STRING", {"default": "", "multiline": False}),
+                "文件名": ("STRING", {"default": "", "multiline": False}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("STRING",)
+    RETURN_TYPES = ()
     FUNCTION = "encrypt"
-    CATEGORY = "B站-此生已陷-数据加密"
+    CATEGORY = "B站-此生已陷-内容加密"
     OUTPUT_NODE = True
 
     def encrypt(self, 音频, 密码="", 文件名="", unique_id=None):
-        wav_data = _wav_bytes(音频)
-        enc = encrypt_data(wav_data, CONTENT_AUDIO, 密码, 文件名 or "audio.wav")
-        fn = _save(enc, "encrypted_audio", 文件名, ".png")
-        return {"ui": {"csyx_image": [fn], "csyx_mode": ["encrypt"]}, "result": (fn,)}
+        _ensure_fast_crypto()
+        fd, wav_path = tempfile.mkstemp(suffix=".wav", dir=_temp_dir())
+        os.close(fd)
+        try:
+            _write_wav(音频, wav_path)
+            with open(wav_path, "rb") as source:
+                descriptor = _save_encrypted_stream(
+                    source, os.path.getsize(wav_path), CONTENT_AUDIO, 密码,
+                    "audio.wav", "audio/wav", "encrypted_audio", 文件名,
+                )
+        finally:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+        return _ui_result([descriptor])
 
 
 class FileEncryptNode:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "文件路径": ("STRING", {"default": ""}),
-                "密码": ("STRING", {"default": ""}),
-                "文件名": ("STRING", {"default": ""}),
-            }
+            "required": {"文件路径": (_input_files(), {"image_upload": False})},
+            "optional": {
+                "密码": ("STRING", {"default": "", "multiline": False}),
+                "文件名": ("STRING", {"default": "", "multiline": False}),
+            },
         }
 
-    RETURN_TYPES = ("STRING",)
+    RETURN_TYPES = ()
     FUNCTION = "encrypt"
-    CATEGORY = "B站-此生已陷-数据加密"
+    CATEGORY = "B站-此生已陷-内容加密"
     OUTPUT_NODE = True
 
-    def encrypt(self, 文件路径, 密码="", 文件名="", unique_id=None):
-        if not 文件路径 or not os.path.exists(文件路径):
-            raise ValueError(f"文件不存在: {文件路径}")
-        data = _read_file_bytes(文件路径)
-        fn_base = 文件名 or os.path.basename(文件路径)
-        enc = encrypt_data(data, CONTENT_FILE, 密码, fn_base)
-        fn = _save(enc, "encrypted_file", 文件名, ".png")
-        return {"ui": {"csyx_image": [fn], "csyx_mode": ["encrypt"]}, "result": (fn,)}
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        # 文件列表会随上传变化；真正的路径边界在执行时校验。
+        return True
+
+    def encrypt(self, 文件路径, 密码="", 文件名=""):
+        expanded = _resolve_input_file(文件路径)
+        mime_type = mimetypes.guess_type(expanded)[0] or "application/octet-stream"
+        with open(expanded, "rb") as source:
+            descriptor = _save_encrypted_stream(
+                source, os.path.getsize(expanded), CONTENT_FILE, 密码,
+                os.path.basename(expanded), mime_type, "encrypted_file", 文件名,
+            )
+        return _ui_result([descriptor])
 
 
-# ============================================================
-# ComfyUI 注册
-# ============================================================
 NODE_CLASS_MAPPINGS = {
     "CSYX_ImageEncrypt": ImageEncryptNode,
     "CSYX_VideoEncrypt": VideoEncryptNode,

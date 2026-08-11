@@ -1,351 +1,369 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { responsiveGridGeometry } from "./csyx_preview_layout.js";
 
-const MANAGED = ["CSYX_ImageEncrypt", "CSYX_VideoEncrypt", "CSYX_AudioEncrypt", "CSYX_TextEncrypt", "CSYX_FileEncrypt"];
-const CW = ["csyx_iw"];
+const MANAGED = new Set([
+    "CSYX_ImageEncrypt",
+    "CSYX_VideoEncrypt",
+    "CSYX_AudioEncrypt",
+    "CSYX_TextEncrypt",
+    "CSYX_FileEncrypt",
+]);
+const PREVIEW_PROP = "_csyx_encrypt_preview_v2";
+const WIDGET_NAME = "csyx_encrypted_preview";
 
-function vu(i) {
-    return api.apiURL(`/view?filename=${encodeURIComponent(i.filename)}&subfolder=${encodeURIComponent(i.subfolder||"")}&type=${encodeURIComponent(i.type||"output")}`);
+function securePasswordWidget(node) {
+    const password = node.widgets?.find((item) => item?.name === "密码");
+    if (!password) return;
+    // Keep the value available to the API prompt, but never persist it in workflow JSON.
+    password.serialize = false;
+    password.label = "密码（不保存）";
+    if (password.inputEl) {
+        password.inputEl.type = "password";
+        password.inputEl.autocomplete = "new-password";
+        password.inputEl.spellcheck = false;
+    }
 }
 
-function downloadFile(url, filename) {
-    const a = document.createElement("a");
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click();
-    document.body.removeChild(a);
+function normalizeItems(items) {
+    if (!Array.isArray(items)) return [];
+    return items.map((item) => {
+        if (typeof item === "string") {
+            return { filename: item, subfolder: "", type: "output" };
+        }
+        if (!item || typeof item.filename !== "string") return null;
+        return {
+            filename: item.filename,
+            subfolder: item.subfolder || "",
+            type: item.type || "output",
+        };
+    }).filter(Boolean);
 }
 
-function forwardWheelToCanvas(e) {
-    const canvasEl = app.canvas?.canvas ?? app.canvasEl;
-    if (!canvasEl) return;
-    const rect = canvasEl.getBoundingClientRect();
-    const fakeEvent = new WheelEvent("wheel", {
-        deltaX: e.deltaX, deltaY: e.deltaY, deltaZ: e.deltaZ,
-        deltaMode: e.deltaMode,
-        clientX: e.clientX, clientY: e.clientY,
-        bubbles: false, cancelable: true,
+function outputItems(message) {
+    if (!message) return [];
+    const standard = normalizeItems(message.images);
+    return standard.length ? standard : normalizeItems(message.csyx_image);
+}
+
+function viewUrl(item, lightweight = false) {
+    const params = new URLSearchParams({
+        filename: item.filename,
+        subfolder: item.subfolder || "",
+        type: item.type || "output",
     });
-    fakeEvent.canvasX = (e.clientX - rect.left) / (app.canvas?.ds?.scale ?? 1) - (app.canvas?.ds?.offset?.[0] ?? 0);
-    fakeEvent.canvasY = (e.clientY - rect.top) / (app.canvas?.ds?.scale ?? 1) - (app.canvas?.ds?.offset?.[1] ?? 0);
-    canvasEl.dispatchEvent(fakeEvent);
+    if (lightweight) params.set("preview", "webp;80");
+    return api.apiURL(`/view?${params.toString()}`);
+}
+
+function downloadFile(item) {
+    const anchor = document.createElement("a");
+    anchor.href = viewUrl(item, false);
+    anchor.download = item.filename;
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    anchor.click();
+    setTimeout(() => anchor.remove(), 0);
 }
 
 function showNodeContextMenu(node, clientX, clientY) {
     const canvas = app.canvas;
-    if (!canvas) return;
-    const canvasEl = canvas.canvas ?? app.canvasEl;
-    if (!canvasEl) return;
-    const rect = canvasEl.getBoundingClientRect();
+    const canvasElement = canvas?.canvas ?? app.canvasEl;
+    if (!canvas?.processContextMenu || !canvasElement) return;
+    const rect = canvasElement.getBoundingClientRect();
     const scale = canvas.ds?.scale ?? 1;
-    const fakeEvent = new MouseEvent("contextmenu", {
-        clientX, clientY,
-        button: 2, bubbles: true, cancelable: true,
+    const event = new MouseEvent("contextmenu", {
+        clientX,
+        clientY,
+        button: 2,
+        bubbles: true,
+        cancelable: true,
     });
-    fakeEvent.canvasX = (clientX - rect.left) / scale - (canvas.ds?.offset?.[0] ?? 0);
-    fakeEvent.canvasY = (clientY - rect.top) / scale - (canvas.ds?.offset?.[1] ?? 0);
-    fakeEvent.preventDefault = () => {};
-    fakeEvent.stopPropagation = () => {};
-    canvas.processContextMenu(node, fakeEvent);
+    event.canvasX = (clientX - rect.left) / scale - (canvas.ds?.offset?.[0] ?? 0);
+    event.canvasY = (clientY - rect.top) / scale - (canvas.ds?.offset?.[1] ?? 0);
+    canvas.processContextMenu(node, event);
+}
+
+function removeWidget(node) {
+    node._csyxPreviewGeneration = (node._csyxPreviewGeneration || 0) + 1;
+    if (node._csyxPreviewLayoutFrame != null) {
+        globalThis.cancelAnimationFrame?.(node._csyxPreviewLayoutFrame);
+        globalThis.clearTimeout?.(node._csyxPreviewLayoutFrame);
+        node._csyxPreviewLayoutFrame = null;
+    }
+    node._csyxPreviewObserver?.disconnect?.();
+    node._csyxPreviewObserver = null;
+    const widget = node._csyxPreviewWidget;
+    if (!widget) return;
+    const element = widget.element;
+    if (element) {
+        element.replaceChildren();
+        element.remove();
+    }
+    const index = node.widgets?.indexOf(widget) ?? -1;
+    if (index >= 0) node.widgets.splice(index, 1);
+    node._csyxPreviewWidget = null;
+    node._csyxPreviewCells = null;
+    node._csyxPreviewAspects = null;
+    node._csyxPendingPreviewWidth = null;
+}
+
+function suppressNativeNodePreview(node) {
+    // ComfyUI 的标准 images 仍保存在执行结果中，只清理节点画布上的原生图片对象。
+    if (Array.isArray(node.imgs)) node.imgs.length = 0;
+    node.imgs = null;
+    node.imageIndex = null;
+    node.animatedImages = false;
+}
+
+function applyResponsivePreviewLayout(node, widthOverride) {
+    const widget = node._csyxPreviewWidget;
+    const element = widget?.element;
+    const cells = node._csyxPreviewCells || [];
+    if (!widget || !element || !cells.length) return null;
+
+    const nodeWidth = Number(widthOverride ?? node.size?.[0] ?? 300);
+    const contentWidth = Math.max(160, nodeWidth - 20);
+    const geometry = responsiveGridGeometry(cells.length, contentWidth, node._csyxPreviewAspects || []);
+    element.style.gridTemplateColumns = `repeat(${geometry.columns},minmax(0,1fr))`;
+    element.style.minHeight = "0";
+    element.style.height = `${geometry.height}px`;
+    for (let index = 0; index < cells.length; index++) {
+        const row = Math.floor(index / geometry.columns);
+        cells[index].style.height = `${geometry.rowHeights[row]}px`;
+    }
+
+    widget.computedHeight = geometry.height;
+    widget.computeLayoutSize = () => ({
+        minHeight: geometry.height,
+        maxHeight: geometry.height,
+        minWidth: 200,
+    });
+    return geometry;
+}
+
+function fitNodeToCustomPreview(node, widthOverride) {
+    suppressNativeNodePreview(node);
+    if (node._csyxPreviewFitting) return;
+    node._csyxPreviewFitting = true;
+    try {
+        const width = Math.max(260, Number(widthOverride ?? node.size?.[0] ?? 300));
+        applyResponsivePreviewLayout(node, width);
+        let computedHeight = Number(node.size?.[1] || 300);
+        try {
+            const computed = node.computeSize?.();
+            if (Array.isArray(computed) && Number.isFinite(computed[1])) {
+                computedHeight = Math.max(220, computed[1]);
+            }
+        } catch (_) {}
+        if (Math.abs(Number(node.size?.[0] || 0) - width) > 0.5
+            || Math.abs(Number(node.size?.[1] || 0) - computedHeight) > 0.5) {
+            node.setSize?.([width, computedHeight]);
+        }
+        app.graph?.setDirtyCanvas?.(true, true);
+        app.canvas?.setDirty?.(true, true);
+    } finally {
+        node._csyxPreviewFitting = false;
+    }
+}
+
+function scheduleResponsivePreviewLayout(node, widthOverride) {
+    if (!node._csyxPreviewWidget) return;
+    if (Number.isFinite(Number(widthOverride))) node._csyxPendingPreviewWidth = Number(widthOverride);
+    if (node._csyxPreviewLayoutFrame != null) return;
+    const run = () => {
+        node._csyxPreviewLayoutFrame = null;
+        const pendingWidth = node._csyxPendingPreviewWidth;
+        node._csyxPendingPreviewWidth = null;
+        fitNodeToCustomPreview(node, pendingWidth);
+    };
+    if (typeof requestAnimationFrame === "function") {
+        node._csyxPreviewLayoutFrame = requestAnimationFrame(run);
+    } else {
+        node._csyxPreviewLayoutFrame = setTimeout(run, 0);
+    }
+}
+
+function scheduleNativePreviewSuppression(node) {
+    // 原生预览的图片加载是异步的；分阶段清理，防止稍后再次写回 node.imgs。
+    for (const delay of [0, 50, 250, 1000]) {
+        setTimeout(() => {
+            if (!node._csyxPreviewWidget) return;
+            scheduleResponsivePreviewLayout(node);
+        }, delay);
+    }
+}
+
+function createPreviewElement(node, items) {
+    const generation = node._csyxPreviewGeneration || 0;
+    const root = document.createElement("div");
+    root.className = "csyx-encrypted-preview";
+    root.style.cssText = [
+        "width:100%", "min-height:0", "height:auto", "display:grid",
+        "grid-template-columns:repeat(1,minmax(0,1fr))",
+        "gap:4px", "align-items:start", "overflow:hidden", "box-sizing:border-box",
+        "border-radius:6px", "background:#111",
+    ].join(";");
+
+    const cells = [];
+    node._csyxPreviewAspects = items.map(() => 1);
+    items.forEach((item, index) => {
+        const cell = document.createElement("div");
+        cell.style.cssText = "position:relative;min-width:0;height:160px;overflow:hidden;background:#111;align-self:start";
+        cells.push(cell);
+
+        const image = new Image();
+        image.alt = item.filename;
+        image.loading = "lazy";
+        image.decoding = "async";
+        image.style.cssText = "width:100%;height:100%;display:block;object-fit:contain;cursor:pointer";
+        image.addEventListener("load", () => {
+            if (node._csyxPreviewGeneration !== generation || !node._csyxPreviewAspects) return;
+            const aspect = image.naturalWidth / Math.max(1, image.naturalHeight);
+            if (Number.isFinite(aspect) && aspect > 0) node._csyxPreviewAspects[index] = aspect;
+            scheduleResponsivePreviewLayout(node);
+        }, { once: true });
+        image.addEventListener("click", () => window.open(viewUrl(item, false), "_blank", "noopener"));
+        image.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            showNodeContextMenu(node, event.clientX, event.clientY);
+        });
+        image.addEventListener("error", () => {
+            if (node._csyxPreviewGeneration !== generation) return;
+            image.remove();
+            const error = document.createElement("button");
+            error.type = "button";
+            error.textContent = `预览加载失败，点击下载\n${item.filename}`;
+            error.style.cssText = "width:100%;height:100%;white-space:pre-wrap;color:#ffd36a;background:#241f15;border:0;cursor:pointer";
+            error.addEventListener("click", () => downloadFile(item));
+            cell.appendChild(error);
+        }, { once: true });
+        image.src = viewUrl(item, true);
+        cell.appendChild(image);
+
+        const label = document.createElement("div");
+        label.textContent = item.filename;
+        label.title = "左键打开完整文件；右键打开操作菜单";
+        label.style.cssText = "position:absolute;left:0;right:0;bottom:0;padding:4px 6px;background:#000b;color:#fff;font:11px sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;pointer-events:none";
+        cell.appendChild(label);
+        root.appendChild(cell);
+    });
+
+    node._csyxPreviewCells = cells;
+
+    return root;
+}
+
+function showPreview(node, rawItems) {
+    const items = normalizeItems(rawItems);
+    if (!items.length) return;
+    node.properties = node.properties || {};
+    node.properties[PREVIEW_PROP] = items;
+    removeWidget(node);
+    suppressNativeNodePreview(node);
+
+    const element = createPreviewElement(node, items);
+    const widget = node.addDOMWidget(WIDGET_NAME, "custom", element, {
+        getValue() { return ""; },
+        setValue() {},
+        serialize: false,
+    });
+    widget.computedHeight = 180;
+    widget.computeSize = (width) => {
+        const geometry = responsiveGridGeometry(
+            items.length,
+            Math.max(160, Number(width || node.size?.[0] || 300) - 20),
+            node._csyxPreviewAspects || [],
+        );
+        return [Math.max(260, width || 300), geometry.height];
+    };
+    node._csyxPreviewWidget = widget;
+
+    applyResponsivePreviewLayout(node);
+    if (typeof ResizeObserver === "function") {
+        let observedWidth = 0;
+        node._csyxPreviewObserver = new ResizeObserver((entries) => {
+            const width = Number(entries?.[0]?.contentRect?.width || 0);
+            if (!(width > 0) || Math.abs(width - observedWidth) < 1) return;
+            observedWidth = width;
+            scheduleResponsivePreviewLayout(node, width + 20);
+        });
+        node._csyxPreviewObserver.observe(element);
+    }
+    scheduleResponsivePreviewLayout(node);
+    scheduleNativePreviewSuppression(node);
 }
 
 app.registerExtension({
-    name: "CSYX.EncryptPreview",
-    async beforeRegisterNodeDef(nodeType, nodeData, _) {
-        if (!MANAGED.includes(nodeData.name)) return;
+    name: "CSYX.EncryptPreviewV2",
 
-        // === 0. 域名高亮 ===
-        const origOnCreated = nodeType.prototype.onNodeCreated;
-        nodeType.prototype.onNodeCreated = function() {
-            let r = origOnCreated ? origOnCreated.apply(this, arguments) : undefined;
-            const el = document.createElement("div");
-            el.style.cssText =
-                "font-size:11px;line-height:14px;color:#FFD700;font-weight:bold;" +
-                "pointer-events:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" +
-                "text-shadow:0 0 4px rgba(255,215,0,0.6), 1px 1px 2px rgba(0,0,0,0.8);";
-            el.textContent = "解码地址：cishengyixian.com";
-            this.addDOMWidget("csyx_domain_tag", "custom", el, {
-                getValue() { return ""; }, setValue() {},
-                serialize: false,
-                computedHeight: 18,
-            });
-            this._cx_domainEl = el;
-            return r;
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (!MANAGED.has(nodeData.name)) return;
+
+        const originalCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            const result = originalCreated?.apply(this, arguments);
+            this.properties = this.properties || {};
+            securePasswordWidget(this);
+            return result;
         };
 
-        // === 1. adjustHeight ===
-        nodeType.prototype._cxAdjustHeight = function() {
-            const curW = this.size?.[0] || 300;
-            let wh = 0;
-            for (const wgt of (this.widgets || [])) {
-                if (CW.includes(wgt.name) || wgt.name === "csyx_domain_tag") continue;
-                if (wgt.type === "hidden") continue;
-                wh += (wgt.computedHeight || 22) + 4;
+        const originalExecuted = nodeType.prototype.onExecuted;
+        nodeType.prototype.onExecuted = function (message) {
+            // 标准 images 留给历史、底部结果和资产系统；节点画布只加载轻量缩略图。
+            if (originalExecuted) {
+                const messageWithoutFullNodePreview = { ...message, images: [] };
+                originalExecuted.call(this, messageWithoutFullNodePreview);
             }
-            const imgH = this._cx_imgH || 0;
-            const hdr = (typeof LiteGraph !== "undefined" && LiteGraph.NODE_TITLE_HEIGHT) || 26;
-            const dh = this._cx_domainEl ? 18 : 0;
-            const totalH = hdr + dh + wh + imgH + 4 + 32;
-            const curH = this.size?.[1] || 0;
-            if (Math.abs(curH - totalH) > 2) {
-                this._cx_resizing = true;
-                this.size[1] = totalH;
-                this._cx_resizing = false;
-            }
-            if (app.graph) app.graph.setDirtyCanvas(true, true);
+            const items = outputItems(message);
+            if (items.length) showPreview(this, items);
         };
 
-        // === onResize ===
-        const origOnResize = nodeType.prototype.onResize;
-        nodeType.prototype.onResize = function() {
-            if (origOnResize) origOnResize.apply(this, arguments);
-            if (this._cx_resizing) return;
-            if (this._cxImgList && this._cxImgList.length > 0) {
-                const hasRatio = this._cxImgList.some(it => it.ratio > 0);
-                if (!hasRatio) return;
-            }
-            this._cx_resizing = true;
-            if (this._cxImgList?.length) {
-                const nw = this.size?.[0] || 300;
-                const nn = this._cxImgList.length;
-                if (nn === 1 && this._cx_imgRatio) {
-                    this._cx_imgH = Math.ceil(nw / this._cx_imgRatio);
-                } else if (nn > 1) {
-                    const refW2 = Math.max(50, Math.round((nw - (nn - 1) * 4) / nn));
-                    let h = 200;
-                    for (const it of this._cxImgList) {
-                        if (it.ratio > 0) h = Math.max(h, Math.ceil(refW2 / it.ratio));
-                    }
-                    this._cx_imgH = h;
-                    if (this._cx_imgWidget?.element) {
-                        this._cx_imgWidget.element.style.height = h + "px";
-                    }
-                }
-            }
-            this._cxAdjustHeight();
-            this._cx_resizing = false;
+        const originalConfigured = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            const result = originalConfigured?.apply(this, arguments);
+            securePasswordWidget(this);
+            const items = normalizeItems(this.properties?.[PREVIEW_PROP]);
+            if (items.length) setTimeout(() => showPreview(this, items), 0);
+            return result;
         };
 
-        const origExtra = nodeType.prototype.getExtraMenuOptions;
-        nodeType.prototype.getExtraMenuOptions = function(_, options) {
-            let r = origExtra ? origExtra.apply(this, arguments) : undefined;
-            const node = this;
-            if (node._cxImgList && node._cxImgList.length > 0) {
-                if (options.length > 0 && options[options.length - 1] !== null) options.push(null);
-                for (const imgItem of node._cxImgList) {
-                    options.push({ content: `保存图片: ${imgItem.filename}`, callback: () => downloadFile(imgItem.url, imgItem.filename) });
-                }
-                options.push({ content: "在新窗口打开所有图片", callback: () => {
-                    for (const imgItem of node._cxImgList) window.open(imgItem.url, "_blank");
-                }});
-            }
-            return r;
+        const originalDrawBackground = nodeType.prototype.onDrawBackground;
+        nodeType.prototype.onDrawBackground = function () {
+            if (this._csyxPreviewWidget) suppressNativeNodePreview(this);
+            return originalDrawBackground?.apply(this, arguments);
         };
 
-        // === 3. 注册 onExecuted ===
-        const origExec = nodeType.prototype.onExecuted;
-        nodeType.prototype.onExecuted = function(msg) {
-            if (origExec) origExec.apply(this, arguments);
-            const mode = msg?.csyx_mode?.[0];
-            if (!mode) return;
-
-            this._cxRemoveAll();
-
-            if (msg?.csyx_image?.length > 0) {
-                for (let idx = 0; idx < msg.csyx_image.length; idx++) {
-                    this._cxAddImgItem(vu({filename: msg.csyx_image[idx], subfolder: "", type: "output"}), idx);
-                }
+        const originalResize = nodeType.prototype.onResize;
+        nodeType.prototype.onResize = function (size) {
+            const result = originalResize?.apply(this, arguments);
+            if (this._csyxPreviewWidget && !this._csyxPreviewFitting) {
+                scheduleResponsivePreviewLayout(this, Array.isArray(size) ? size[0] : this.size?.[0]);
             }
+            return result;
         };
 
-        // === 4. _cxRemoveAll ===
-        nodeType.prototype._cxRemoveAll = function() {
-            this._cx_cleaning = true;
-            this._cxImgList = [];
-            this._cx_imgRatio = 0;
-            this._cx_imgH = 0;
-            this._cx_cleaning = false;
-
-            if (this._cx_imgRo) {
-                this._cx_imgRo.disconnect();
-                this._cx_imgRo = null;
-            }
-
-            if (this.widgets) {
-                for (let i = this.widgets.length - 1; i >= 0; i--) {
-                    const w = this.widgets[i];
-                    if (CW.includes(w.name)) {
-                        if (w.element) {
-                            if (w.element.parentNode) {
-                                w.element.parentNode.removeChild(w.element);
-                            }
-                            w.element = null;
-                        }
-                        this.widgets.splice(i, 1);
-                    }
-                }
-            }
-
-            this._cx_imgWidget = null;
-            this._cxAdjustHeight();
+        const originalRemoved = nodeType.prototype.onRemoved;
+        nodeType.prototype.onRemoved = function () {
+            removeWidget(this);
+            return originalRemoved?.apply(this, arguments);
         };
 
-        // === 5. 图片 DOM widget 渲染 ===
-        nodeType.prototype._cxAddImgItem = function(url, index) {
-            const node = this;
-            const img = new Image();
-            img.src = url;
-
-            const item = {
-                img: img,
-                url: url,
-                filename: url.split('/').pop()?.split('?')[0] || "image.png",
-                ratio: 0
-            };
-            if (!this._cxImgList) this._cxImgList = [];
-            this._cxImgList.push(item);
-
-            img.onload = () => {
-                if (node._cx_cleaning || !node._cxImgList || node._cxImgList.length === 0) return;
-                item.ratio = img.naturalWidth / img.naturalHeight;
-                node._cx_imgRatio = item.ratio;
-                node._cxRefreshImgWidget();
-                if (app.canvas) app.canvas.setDirty(true);
-            };
-            if (img.complete && img.naturalWidth > 0) {
-                item.ratio = img.naturalWidth / img.naturalHeight;
-                node._cx_imgRatio = item.ratio;
-            }
-        };
-
-        nodeType.prototype._cxRefreshImgWidget = function() {
-            const node = this;
-            if (node._cx_cleaning) return;
-            if (!node._cxImgList || node._cxImgList.length === 0) return;
-            const n = node._cxImgList.length;
-
-            const ready = node._cxImgList.filter(it => it.ratio > 0);
-            if (ready.length === 0) return;
-
-            const curW = node.size?.[0] || 300;
-            let imgH, initW;
-            if (n === 1) {
-                const r = ready[0].ratio;
-                initW = Math.min(600, Math.max(250, Math.round(r * 250)));
-                imgH = Math.ceil(initW / r);
-            } else {
-                initW = curW;
-                const refW2 = Math.max(50, Math.round((curW - (n - 1) * 4) / n));
-                imgH = 200;
-                for (const it of ready) {
-                    if (it.ratio > 0) imgH = Math.max(imgH, Math.ceil(refW2 / it.ratio));
+        const originalMenu = nodeType.prototype.getExtraMenuOptions;
+        nodeType.prototype.getExtraMenuOptions = function (_, options) {
+            const result = originalMenu?.apply(this, arguments);
+            const items = normalizeItems(this.properties?.[PREVIEW_PROP]);
+            if (items.length) {
+                if (options.length && options[options.length - 1] !== null) options.push(null);
+                for (const item of items) {
+                    options.push({
+                        content: `保存完整加密文件：${item.filename}`,
+                        callback: () => downloadFile(item),
+                    });
                 }
             }
-
-            function calcImgH(nodeW) {
-                if (n === 1 && node._cx_imgRatio) return Math.ceil(nodeW / node._cx_imgRatio);
-                if (n > 1) {
-                    const refW2 = Math.max(50, Math.round((nodeW - (n - 1) * 4) / n));
-                    let h = 200;
-                    for (const it of node._cxImgList) {
-                        if (it.ratio > 0) h = Math.max(h, Math.ceil(refW2 / it.ratio));
-                    }
-                    return h;
-                }
-                return 200;
-            }
-
-            if (!node._cx_imgWidget) {
-                const container = document.createElement("div");
-                container.style.cssText = "width:100%;overflow:hidden;border-radius:6px;";
-
-                node._cx_imgWidget = node.addDOMWidget("csyx_iw", "custom", container, {
-                    getValue() { return ""; },
-                    setValue() {},
-                    serialize: false,
-                });
-
-                node._cx_imgWidget.computeSize = function() {
-                    const nw = node.size?.[0] || 300;
-                    const newH = calcImgH(nw);
-                    node._cx_imgH = newH;
-                    node._cx_imgWidget.computedHeight = newH;
-                    if (container) container.style.height = newH + "px";
-                    return [nw, newH];
-                };
-
-                node._cx_imgRo = new ResizeObserver(entries => {
-                    const cw = entries[0].contentRect.width;
-                    if (cw <= 0) return;
-                    const newH = calcImgH(cw);
-                    node._cx_imgH = newH;
-                    node._cx_imgWidget.computedHeight = newH;
-                    container.style.height = newH + "px";
-                    if (app.canvas) app.canvas.setDirty(true);
-                });
-
-                container.addEventListener("contextmenu", e => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    showNodeContextMenu(node, e.clientX, e.clientY);
-                });
-                container.addEventListener("wheel", e => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    forwardWheelToCanvas(e);
-                });
-            }
-
-            const container = node._cx_imgWidget.element;
-            if (!container) return;
-            container.innerHTML = "";
-            container.style.height = imgH + "px";
-
-            if (n === 1) {
-                const item = node._cxImgList[0];
-                const el = item.img;
-                el.style.cssText = "width:100%;height:100%;display:block;object-fit:contain;cursor:pointer;";
-                el.addEventListener("click", () => window.open(item.url, "_blank"));
-                container.appendChild(el);
-            } else {
-                container.style.display = "flex";
-                container.style.gap = "4px";
-                const baseW = node.size?.[0] || initW;
-                const refW2 = Math.max(50, Math.round((baseW - (n - 1) * 4) / n));
-                for (const item of node._cxImgList) {
-                    const wrapper = document.createElement("div");
-                    wrapper.className = "csyx-iw-wrap";
-                    wrapper.style.cssText = `width:${refW2}px;flex:1;min-width:0;overflow:hidden;border-radius:4px;`;
-                    const el = new Image();
-                    el.src = item.url;
-                    el.style.cssText = "width:100%;height:100%;display:block;object-fit:contain;cursor:pointer;";
-                    el.addEventListener("click", () => window.open(item.url, "_blank"));
-                    wrapper.appendChild(el);
-                    container.appendChild(wrapper);
-                }
-            }
-
-            if (node._cx_imgRo && container) {
-                node._cx_imgRo.observe(container);
-            }
-
-            node._cx_imgH = imgH;
-            node._cx_imgWidget.computedHeight = imgH;
-
-            let otherH = 0;
-            for (const wgt of (node.widgets || [])) {
-                if (CW.includes(wgt.name) || wgt.name === "csyx_domain_tag") continue;
-                if (wgt.type === "hidden") continue;
-                otherH += (wgt.computedHeight || 22) + 4;
-            }
-            const hdr = (typeof LiteGraph !== "undefined" && LiteGraph.NODE_TITLE_HEIGHT) || 26;
-            const dh = node._cx_domainEl ? 18 : 0;
-            const totalH = hdr + dh + otherH + imgH + 4 + 32;
-
-            node._cx_resizing = true;
-            node.setSize([initW, totalH]);
-            node._cx_resizing = false;
-
-            if (app.graph) app.graph.setDirtyCanvas(true, true);
+            return result;
         };
     },
 });

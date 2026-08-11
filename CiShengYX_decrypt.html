@@ -153,6 +153,10 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 
 <script>
 const MAGIC=new Uint8Array([0x43,0x53,0x59,0x58,0x5f,0x45,0x4e,0x43]);
+const VERSION_V1=1,VERSION_V2=2,VERSION_V3=3,V2_FIXED_SIZE=56,V2_TAG_SIZE=16;
+const V2_DOMAIN=new TextEncoder().encode('CSYX-V2-KEY\0');
+const V3_DOMAIN=new TextEncoder().encode('CSYX-V3-PBKDF2\0');
+const V3_PBKDF2_ITERATIONS=600000;
 const CONTENT_TYPES={1:'图片',2:'视频',3:'文字',4:'音频',5:'文件'};
 const CONTENT_EXT={1:'.png',2:'.mp4',3:'.txt',4:'.wav',5:''};
 const CONTENT_MIME={1:'image/png',2:'video/mp4',3:'text/plain',4:'audio/wav',5:'application/octet-stream'};
@@ -406,156 +410,259 @@ var currentPassword=null;
 var decryptedResults=[];
 var totalCount=0,doneCount=0;
 
-function processFiles(files){
+function equalMagic(data){
+  if(data.length<8)return false;
+  for(var i=0;i<8;i++)if(data[i]!==MAGIC[i])return false;
+  return true;
+}
+
+function readU64(view,offset){
+  var value=view.getBigUint64(offset,false);
+  if(value>BigInt(Number.MAX_SAFE_INTEGER))throw new Error('文件长度超出浏览器可处理范围');
+  return Number(value);
+}
+
+async function readBytes(file,start,length){
+  if(start<0||length<0||start+length>file.size)throw new Error('文件已截断');
+  return new Uint8Array(await file.slice(start,start+length).arrayBuffer());
+}
+
+async function findPngEnd(file){
+  var signature=await readBytes(file,0,8);
+  var expected=[137,80,78,71,13,10,26,10];
+  for(var i=0;i<8;i++)if(signature[i]!==expected[i])throw new Error('不是有效的 PNG 文件');
+  var pos=8;
+  while(pos+12<=file.size){
+    var chunkHead=await readBytes(file,pos,8);
+    var view=new DataView(chunkHead.buffer,chunkHead.byteOffset,chunkHead.byteLength);
+    var length=view.getUint32(0,false);
+    var end=pos+12+length;
+    if(end>file.size)throw new Error('PNG 数据不完整');
+    if(chunkHead[4]===73&&chunkHead[5]===69&&chunkHead[6]===78&&chunkHead[7]===68){
+      if(length!==0)throw new Error('PNG IEND 长度无效');
+      return end;
+    }
+    pos=end;
+  }
+  throw new Error('PNG 缺少 IEND');
+}
+
+async function parseV1Header(file,packetOffset,initial){
+  if(initial.length<57)initial=await readBytes(file,packetOffset,57);
+  var filenameLen=(initial[55]<<8)|initial[56];
+  var header=await readBytes(file,packetOffset,65+filenameLen);
+  var filename=new TextDecoder().decode(header.slice(57,57+filenameLen));
+  var dataLengthOffset=57+filenameLen;
+  var view=new DataView(header.buffer,header.byteOffset,header.byteLength);
+  var dataLen=readU64(view,dataLengthOffset);
+  var cipherOffset=packetOffset+dataLengthOffset+8;
+  if(cipherOffset+dataLen!==file.size)throw new Error('V1 密文长度不正确');
+  return{
+    version:VERSION_V1,contentType:header[9],hasPassword:header[10]===1,
+    salt:header.slice(11,27),iv:header.slice(27,39),tag:header.slice(39,55),
+    filename:filename,cipherOffset:cipherOffset,dataLen:dataLen
+  };
+}
+
+async function parseChunkedHeader(file,packetOffset,version){
+  var fixed=await readBytes(file,packetOffset,V2_FIXED_SIZE);
+  var view=new DataView(fixed.buffer,fixed.byteOffset,fixed.byteLength);
+  var contentType=fixed[9],flags=fixed[10],reserved=fixed[11];
+  var chunkSize=view.getUint32(12,false),plainSize=readU64(view,16);
+  var chunkCount=view.getUint32(24,false),metadataLen=view.getUint32(52,false);
+  if(reserved!==0||(flags&~1)!==0)throw new Error('V2 文件头标志无效');
+  if(chunkSize<65536||chunkSize>67108864)throw new Error('V2 分块大小无效');
+  if(metadataLen>1048576)throw new Error('V2 元数据过大');
+  var expectedCount=Math.max(1,Math.ceil(plainSize/chunkSize));
+  if(chunkCount!==expectedCount)throw new Error('V2 分块数量无效');
+  var header=await readBytes(file,packetOffset,V2_FIXED_SIZE+metadataLen);
+  var metadata;
+  try{metadata=JSON.parse(new TextDecoder().decode(header.slice(V2_FIXED_SIZE)));}
+  catch(err){throw new Error('V2 元数据无效');}
+  if(!metadata||typeof metadata!=='object'||Array.isArray(metadata)||metadata.size!==plainSize)throw new Error('V2 元数据长度不一致');
+  var expectedFileSize=packetOffset+header.length+plainSize+chunkCount*(4+V2_TAG_SIZE);
+  if(expectedFileSize!==file.size)throw new Error('V2 文件长度不正确或文件已截断');
+  return{
+    version:version,contentType:contentType,hasPassword:(flags&1)===1,
+    chunkSize:chunkSize,plainSize:plainSize,chunkCount:chunkCount,
+    salt:fixed.slice(28,44),noncePrefix:fixed.slice(44,52),metadata:metadata,
+    filename:metadata.filename||'',mime:metadata.mime||'',header:header,
+    dataOffset:packetOffset+header.length
+  };
+}
+
+async function parseFile(file){
+  var packetOffset=await findPngEnd(file);
+  if(packetOffset+9>file.size)throw new Error('文件没有加密数据');
+  var initial=await readBytes(file,packetOffset,Math.min(57,file.size-packetOffset));
+  if(!equalMagic(initial))throw new Error('不是 CSYX 加密文件');
+  var parsed;
+  if(initial[8]===VERSION_V1)parsed=await parseV1Header(file,packetOffset,initial);
+  else if(initial[8]===VERSION_V2||initial[8]===VERSION_V3)parsed=await parseChunkedHeader(file,packetOffset,initial[8]);
+  else throw new Error('不支持的 CSYX 版本：'+initial[8]);
+  return{file:file,packetOffset:packetOffset,parsed:parsed};
+}
+
+async function processFiles(files){
+  if(!files.length)return;
+  if(!window.crypto||!crypto.subtle){
+    addResult('','❌','当前浏览器不支持 Web Crypto，无法安全解密','error');return;
+  }
   var fileDataList=[];
-  var loaded=0;
-  if(files.length===0)return;
-
-  files.forEach(function(file){
-    var reader=new FileReader();
-    reader.onload=function(){
-      var data=new Uint8Array(reader.result);
-      var parsed=parseHeader(data);
-      if(parsed)fileDataList.push({file:file,data:data,parsed:parsed});
-      loaded++;
-      if(loaded===files.length){
-        if(fileDataList.length===0){addResult('','❌','未找到有效的加密文件','error');return;}
-        totalCount=fileDataList.length;doneCount=0;
-        statsBar.classList.add('active');
-        statsTotal.textContent=totalCount;statsDone.textContent='0';
-        var needsPassword=fileDataList.some(function(f){return f.parsed.hasPassword;});
-        if(needsPassword&&currentPassword===null){
-          pendingFiles=fileDataList;showPasswordModal();return;
-        }
-        decryptAll(fileDataList,currentPassword||'');
-      }
-    };
-    reader.readAsArrayBuffer(file);
-  });
+  for(var i=0;i<files.length;i++){
+    try{fileDataList.push(await parseFile(files[i]));}
+    catch(err){addResult(files[i].name,'❌',err.message||'无法识别加密文件','error');}
+  }
+  if(fileDataList.length===0){addResult('','❌','未找到有效的加密文件','error');return;}
+  totalCount=fileDataList.length;doneCount=0;
+  statsBar.classList.add('active');
+  statsTotal.textContent=totalCount;statsDone.textContent='0';
+  var needsPassword=fileDataList.some(function(item){return item.parsed.hasPassword;});
+  if(needsPassword&&currentPassword===null){pendingFiles=fileDataList;showPasswordModal();return;}
+  await decryptAll(fileDataList,currentPassword||'');
 }
 
-function decryptAll(fileDataList,password){
+async function decryptAll(fileDataList,password){
   decryptedResults=[];
-  var useZip=fileDataList.length>=ZIP_THRESHOLD;
-  var idx=0;
-  function next(){
-    if(idx>=fileDataList.length){
-      if(useZip&&decryptedResults.length>0)downloadAsZip(decryptedResults);
-      currentPassword=null;
-      return;
-    }
-    var item=fileDataList[idx];idx++;
-    decryptFile(item,password,!useZip).then(function(result){
-      if(result)decryptedResults.push(result);
-      doneCount++;statsDone.textContent=doneCount;
-      next();
-    });
+  var totalEncrypted=fileDataList.reduce(function(sum,item){return sum+item.file.size;},0);
+  var zipAvailable=typeof JSZip!=='undefined';
+  var useZip=fileDataList.length>=ZIP_THRESHOLD&&totalEncrypted<=512*1024*1024&&zipAvailable;
+  if(fileDataList.length>=ZIP_THRESHOLD&&!useZip){
+    var reason=zipAvailable?'文件总体积较大，将逐个下载以降低内存占用':'ZIP 组件未加载，将逐个下载';
+    addResult('批量下载','ℹ️',reason,'success');
   }
-  next();
-}
-
-// ============================
-// PNG parsing
-// ============================
-function findIEND(data){
-  for(var i=8;i<data.length-12;i++){
-    if(data[i+4]===0x49&&data[i+5]===0x45&&data[i+6]===0x4e&&data[i+7]===0x44){
-      var len=(data[i]<<24)|(data[i+1]<<16)|(data[i+2]<<8)|data[i+3];
-      return i+12+len;
-    }
+  for(var index=0;index<fileDataList.length;index++){
+    var result=await decryptFile(fileDataList[index],password,!useZip);
+    if(useZip&&result)decryptedResults.push(result);
+    doneCount++;statsDone.textContent=doneCount;
   }
-  return -1;
-}
-
-function parseHeader(data){
-  var iendPos=findIEND(data);
-  if(iendPos<0||iendPos>=data.length)return null;
-  var p=data.slice(iendPos);
-  if(p.length<57)return null;
-  for(var i=0;i<8;i++){if(p[i]!==MAGIC[i])return null;}
-  var contentType=p[9],hasPassword=p[10]===1;
-  var salt=p.slice(11,27),iv=p.slice(27,39),tag=p.slice(39,55);
-  var filenameLen=(p[55]<<8)|p[56];
-  var filename=new TextDecoder().decode(p.slice(57,57+filenameLen));
-  var dOff=57+filenameLen;
-  var dv=new DataView(p.buffer,p.byteOffset+dOff,8);
-  var dataLen=Number(dv.getBigUint64(0));
-  var ciphertext=p.slice(dOff+8,dOff+8+dataLen);
-  return{contentType:contentType,hasPassword:hasPassword,salt:salt,iv:iv,tag:tag,filename:filename,ciphertext:ciphertext};
+  if(useZip&&decryptedResults.length>0)await downloadAsZip(decryptedResults);
+  decryptedResults=[];
+  currentPassword=null;
 }
 
 // ============================
 // AES-256-GCM
 // ============================
-function deriveKey(password,salt){
-  var enc=new TextEncoder();
-  return crypto.subtle.importKey('raw',enc.encode(password),'PBKDF2',false,['deriveKey']).then(function(km){
-    return crypto.subtle.deriveKey({name:'PBKDF2',salt:salt,iterations:100000,hash:'SHA-256'},km,{name:'AES-GCM',length:256},false,['decrypt']);
-  });
+async function deriveV1Key(password,salt){
+  var material=await crypto.subtle.importKey('raw',new TextEncoder().encode(password),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt:salt,iterations:100000,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['decrypt']);
 }
 
-function aesDecrypt(key,iv,ciphertext,tag){
-  var combined=new Uint8Array(ciphertext.length+tag.length);
-  combined.set(ciphertext);combined.set(tag,ciphertext.length);
-  return crypto.subtle.decrypt({name:'AES-GCM',iv:iv},key,combined).then(function(buf){return new Uint8Array(buf);});
+async function deriveV2Key(password,salt){
+  var pwd=new TextEncoder().encode(password||'CSYX_DEFAULT_KEY');
+  var raw=new Uint8Array(V2_DOMAIN.length+salt.length+pwd.length);
+  raw.set(V2_DOMAIN,0);raw.set(salt,V2_DOMAIN.length);raw.set(pwd,V2_DOMAIN.length+salt.length);
+  var digest=await crypto.subtle.digest('SHA-256',raw);
+  return crypto.subtle.importKey('raw',digest,{name:'AES-GCM'},false,['decrypt']);
 }
 
-// ============================
-// Decrypt
-// ============================
-function decryptFile(item,password,autoDownload){
-  var file=item.file,parsed=item.parsed;
+async function deriveV3Key(password,salt){
+  var pwd=new TextEncoder().encode(password||'CSYX_DEFAULT_KEY');
+  var material=await crypto.subtle.importKey('raw',pwd,'PBKDF2',false,['deriveKey']);
+  var domainSalt=concatBytes(V3_DOMAIN,salt);
+  return crypto.subtle.deriveKey(
+    {name:'PBKDF2',salt:domainSalt,iterations:V3_PBKDF2_ITERATIONS,hash:'SHA-256'},
+    material,{name:'AES-GCM',length:256},false,['decrypt']
+  );
+}
+
+function concatBytes(a,b){
+  var result=new Uint8Array(a.length+b.length);result.set(a,0);result.set(b,a.length);return result;
+}
+
+async function decryptV1(item,password,progressEl){
+  var parsed=item.parsed;
+  var ciphertext=await readBytes(item.file,parsed.cipherOffset,parsed.dataLen);
+  var combined=concatBytes(ciphertext,parsed.tag);
+  var pwd=parsed.hasPassword?password:'CSYX_DEFAULT_KEY';
+  var key=await deriveV1Key(pwd,parsed.salt);
+  var plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:parsed.iv},key,combined);
+  updateResult(progressEl,'正在完成旧版文件...','loading',95);
+  return new Blob([plain],{type:CONTENT_MIME[parsed.contentType]||'application/octet-stream'});
+}
+
+async function decryptChunked(item,password,progressEl){
+  var parsed=item.parsed;
+  var key=parsed.version===VERSION_V3
+    ?await deriveV3Key(parsed.hasPassword?password:'',parsed.salt)
+    :await deriveV2Key(parsed.hasPassword?password:'',parsed.salt);
+  var parts=[],position=parsed.dataOffset,decoded=0;
+  for(var index=0;index<parsed.chunkCount;index++){
+    var lengthBytes=await readBytes(item.file,position,4);position+=4;
+    var lengthView=new DataView(lengthBytes.buffer,lengthBytes.byteOffset,4);
+    var plainLength=lengthView.getUint32(0,false);
+    var expected=Math.min(parsed.chunkSize,parsed.plainSize-decoded);
+    if(parsed.plainSize===0)expected=0;
+    if(plainLength!==expected)throw new Error('V2 加密块长度无效');
+    var encrypted=await item.file.slice(position,position+plainLength+V2_TAG_SIZE).arrayBuffer();
+    position+=plainLength+V2_TAG_SIZE;
+    var nonce=new Uint8Array(12);nonce.set(parsed.noncePrefix,0);
+    new DataView(nonce.buffer).setUint32(8,index,false);
+    var indexBytes=new Uint8Array(4);new DataView(indexBytes.buffer).setUint32(0,index,false);
+    var aad=concatBytes(parsed.header,indexBytes);
+    var plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:nonce,additionalData:aad,tagLength:128},key,encrypted);
+    parts.push(plain);decoded+=plain.byteLength;
+    var progress=Math.max(1,Math.round((index+1)/parsed.chunkCount*98));
+    updateResult(progressEl,'正在分块解密... '+progress+'%','loading',progress);
+  }
+  if(position!==item.file.size||decoded!==parsed.plainSize)throw new Error('V2 解密总长度不正确');
+  return new Blob(parts,{type:parsed.mime||CONTENT_MIME[parsed.contentType]||'application/octet-stream'});
+}
+
+async function decryptFile(item,password,autoDownload){
+  var parsed=item.parsed,file=item.file;
   var typeLabel=CONTENT_TYPES[parsed.contentType]||'未知';
   var emoji=CONTENT_EMOJI[parsed.contentType]||'📄';
   var el=addResult(file.name,emoji,'正在解密 '+typeLabel+'...','loading',true);
-  var pwd=parsed.hasPassword?password:'CSYX_DEFAULT_KEY';
-
-  return deriveKey(pwd,parsed.salt).then(function(key){
-    return aesDecrypt(key,parsed.iv,parsed.ciphertext,parsed.tag);
-  }).then(function(decrypted){
+  try{
+    var decrypted=parsed.version===VERSION_V2||parsed.version===VERSION_V3
+      ?await decryptChunked(item,password,el)
+      :await decryptV1(item,password,el);
+    var filename=safeFilename(parsed.filename||('decrypted'+(CONTENT_EXT[parsed.contentType]||'.bin')));
+    var mime=parsed.mime||CONTENT_MIME[parsed.contentType]||'application/octet-stream';
     updateResult(el,typeLabel+' 解密成功！','success',100);
-    var filename=parsed.filename||('decrypted'+(CONTENT_EXT[parsed.contentType]||'.bin'));
-    var mime=CONTENT_MIME[parsed.contentType]||'application/octet-stream';
     if(autoDownload)downloadBlob(decrypted,filename,mime);
     return{data:decrypted,filename:filename,mime:mime};
-  }).catch(function(err){
-    var msg='解密失败';
+  }catch(err){
+    var msg='解密失败：'+(err.message||'未知错误');
     if(err.name==='OperationError')msg=parsed.hasPassword?'密码错误或文件已损坏':'文件已损坏';
     updateResult(el,msg,'error',0);
     return null;
-  });
+  }
 }
 
 // ============================
 // Download
 // ============================
-function downloadBlob(data,filename,mime){
-  var blob=new Blob([data],{type:mime});
-  var url=URL.createObjectURL(blob);
-  var a=document.createElement('a');a.href=url;a.download=filename;
-  document.body.appendChild(a);a.click();
-  setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},200);
+function safeFilename(filename){
+  var value=String(filename||'decrypted.bin').replace(/[\\/:*?"<>|\u0000-\u001f]/g,'_').replace(/[. ]+$/,'');
+  return value.slice(0,240)||'decrypted.bin';
 }
 
-function downloadAsZip(results){
+function downloadBlob(data,filename,mime){
+  var blob=data instanceof Blob?data:new Blob([data],{type:mime});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');a.href=url;a.download=safeFilename(filename);
+  document.body.appendChild(a);a.click();
+  setTimeout(function(){a.remove();URL.revokeObjectURL(url);},5000);
+}
+
+async function downloadAsZip(results){
   var statusEl=addResult('批量下载','📦','正在打包 '+results.length+' 个文件为 ZIP...','loading',true);
-  var zip=new JSZip();
-  var nameCount={};
-  results.forEach(function(r){
-    var name=r.filename;
-    if(nameCount[name]){nameCount[name]++;name=name.replace(/(\.[^.]+)$/,'_'+nameCount[name]+'$1');}
-    else{nameCount[name]=1;}
-    zip.file(name,r.data);
-  });
-  zip.generateAsync({type:'blob'}).then(function(blob){
-    var url=URL.createObjectURL(blob);
-    var a=document.createElement('a');a.href=url;a.download='decrypted_files.zip';
-    document.body.appendChild(a);a.click();
-    setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},200);
+  try{
+    if(typeof JSZip==='undefined')throw new Error('ZIP 组件加载失败，请检查网络后重试');
+    var zip=new JSZip(),nameCount={};
+    results.forEach(function(result){
+      var name=safeFilename(result.filename);
+      if(nameCount[name]){nameCount[name]++;name=name.replace(/(\.[^.]+)$/,'_'+nameCount[name]+'$1');}
+      else nameCount[name]=1;
+      zip.file(name,result.data);
+    });
+    var blob=await zip.generateAsync({type:'blob'});
+    downloadBlob(blob,'decrypted_files.zip','application/zip');
     updateResult(statusEl,'ZIP 打包完成，已开始下载 ✓','success',100);
-  }).catch(function(err){
-    updateResult(statusEl,'ZIP 打包失败: '+err.message,'error',0);
-  });
+  }catch(err){updateResult(statusEl,'ZIP 打包失败: '+err.message,'error',0);}
 }
 
 // ============================
