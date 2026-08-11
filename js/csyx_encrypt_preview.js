@@ -1,6 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { responsiveGridGeometry } from "./csyx_preview_layout.js";
+import { requiredNodeHeight, responsiveGridGeometry } from "./csyx_preview_layout.js";
 
 const MANAGED = new Set([
     "CSYX_ImageEncrypt",
@@ -11,6 +11,7 @@ const MANAGED = new Set([
 ]);
 const PREVIEW_PROP = "_csyx_encrypt_preview_v2";
 const WIDGET_NAME = "csyx_encrypted_preview";
+const PREVIEW_NODE_GAP = 8;
 
 function securePasswordWidget(node) {
     const password = node.widgets?.find((item) => item?.name === "密码");
@@ -105,7 +106,21 @@ function removeWidget(node) {
     node._csyxPreviewWidget = null;
     node._csyxPreviewCells = null;
     node._csyxPreviewAspects = null;
+    node._csyxPreviewHeight = null;
     node._csyxPendingPreviewWidth = null;
+}
+
+function measureBaseNodeHeight(node, previousPreviewHeight = 0) {
+    // Measure after the old preview widget has been removed. LiteGraph and
+    // Nodes 2.0 use different DOM-widget sizing paths, so retain a safe fallback.
+    try {
+        const computed = node.computeSize?.();
+        if (Array.isArray(computed) && Number.isFinite(Number(computed[1])) && Number(computed[1]) > 0) {
+            return Math.max(120, Math.ceil(Number(computed[1])));
+        }
+    } catch (_) {}
+    const currentHeight = Number(node.size?.[1] || 300);
+    return Math.max(120, Math.ceil(currentHeight - Math.max(0, previousPreviewHeight) - PREVIEW_NODE_GAP));
 }
 
 function suppressNativeNodePreview(node) {
@@ -134,11 +149,17 @@ function applyResponsivePreviewLayout(node, widthOverride) {
     }
 
     widget.computedHeight = geometry.height;
+    node._csyxPreviewHeight = geometry.height;
     widget.computeLayoutSize = () => ({
         minHeight: geometry.height,
         maxHeight: geometry.height,
         minWidth: 200,
     });
+    // Both APIs are used in current ComfyUI builds. Supplying all three keeps
+    // the DOM allocation and the LiteGraph node size in agreement.
+    widget.getMinHeight = () => geometry.height;
+    widget.getMaxHeight = () => geometry.height;
+    widget.getHeight = () => geometry.height;
     return geometry;
 }
 
@@ -148,14 +169,21 @@ function fitNodeToCustomPreview(node, widthOverride) {
     node._csyxPreviewFitting = true;
     try {
         const width = Math.max(260, Number(widthOverride ?? node.size?.[0] ?? 300));
-        applyResponsivePreviewLayout(node, width);
-        let computedHeight = Number(node.size?.[1] || 300);
+        const geometry = applyResponsivePreviewLayout(node, width);
+        if (!geometry) return;
+        let computedHeight = 0;
         try {
             const computed = node.computeSize?.();
             if (Array.isArray(computed) && Number.isFinite(computed[1])) {
-                computedHeight = Math.max(220, computed[1]);
+                computedHeight = Math.max(0, Number(computed[1]));
             }
         } catch (_) {}
+        computedHeight = Math.max(220, requiredNodeHeight(
+            node._csyxPreviewBaseHeight,
+            geometry.height,
+            computedHeight,
+            PREVIEW_NODE_GAP,
+        ));
         if (Math.abs(Number(node.size?.[0] || 0) - width) > 0.5
             || Math.abs(Number(node.size?.[1] || 0) - computedHeight) > 0.5) {
             node.setSize?.([width, computedHeight]);
@@ -260,7 +288,11 @@ function showPreview(node, rawItems) {
     if (!items.length) return;
     node.properties = node.properties || {};
     node.properties[PREVIEW_PROP] = items;
+    const previousPreviewHeight = Number(
+        node._csyxPreviewHeight || node._csyxPreviewWidget?.computedHeight || 0,
+    );
     removeWidget(node);
+    node._csyxPreviewBaseHeight = measureBaseNodeHeight(node, previousPreviewHeight);
     suppressNativeNodePreview(node);
 
     const element = createPreviewElement(node, items);
@@ -268,6 +300,9 @@ function showPreview(node, rawItems) {
         getValue() { return ""; },
         setValue() {},
         serialize: false,
+        getMinHeight() { return Number(node._csyxPreviewHeight || 180); },
+        getMaxHeight() { return Number(node._csyxPreviewHeight || 180); },
+        getHeight() { return Number(node._csyxPreviewHeight || 180); },
     });
     widget.computedHeight = 180;
     widget.computeSize = (width) => {

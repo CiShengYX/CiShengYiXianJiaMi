@@ -45,3 +45,15 @@ export function responsiveGridGeometry(itemCount, availableWidth, aspects = [], 
     return { columns, rows, cellWidth, rowHeights, height: Math.ceil(height) };
 }
 
+/**
+ * Keep the LiteGraph node border at least as tall as its DOM preview.
+ * The computed height is kept as a candidate because different ComfyUI
+ * generations account for DOM widget height differently.
+ */
+export function requiredNodeHeight(baseHeight, previewHeight, computedHeight = 0, verticalGap = 8) {
+    const base = Math.max(0, finite(baseHeight, 0));
+    const preview = Math.max(0, finite(previewHeight, 0));
+    const computed = Math.max(0, finite(computedHeight, 0));
+    const gap = Math.max(0, finite(verticalGap, 8));
+    return Math.ceil(Math.max(computed, base + preview + gap));
+}
