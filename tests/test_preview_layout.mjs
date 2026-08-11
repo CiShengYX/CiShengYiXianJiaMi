@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { responsiveGridGeometry } from "../js/csyx_preview_layout.js";
+import { requiredNodeHeight, responsiveGridGeometry } from "../js/csyx_preview_layout.js";
 
 const wideFive = responsiveGridGeometry(5, 880, [0.7, 0.7, 0.7, 0.7, 0.7]);
 assert.equal(wideFive.columns, 5);
@@ -27,6 +27,17 @@ assert.equal(mixed.height, Math.ceil(mixed.rowHeights.reduce((sum, value) => sum
 assert.deepEqual(
     responsiveGridGeometry(0, 600),
     { columns: 0, rows: 0, cellWidth: 600, rowHeights: [], height: 0 },
+);
+
+assert.equal(
+    requiredNodeHeight(210, 400, 390),
+    618,
+    "node height did not include the full preview height and bottom spacing",
+);
+assert.equal(
+    requiredNodeHeight(210, 100, 450),
+    450,
+    "a larger ComfyUI-computed height should not be reduced",
 );
 
 console.log("encrypted preview responsive layout tests passed");
